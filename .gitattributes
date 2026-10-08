@@ -1,0 +1,15 @@
+# 换行与二进制处理：避免 .ico/.exe/.apk 被当成文本改动
+* text=auto
+
+*.ps1  text eol=crlf
+*.cs   text eol=crlf
+*.md   text eol=lf
+*.html text eol=lf
+*.java text eol=lf
+*.ets  text eol=lf
+*.json5 text eol=lf
+
+*.png  binary
+*.ico  binary
+*.apk  binary
+*.exe  binary
