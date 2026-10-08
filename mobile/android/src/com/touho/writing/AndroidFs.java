@@ -253,9 +253,11 @@ class AndroidFs {
     synchronized boolean gitWrite(String rel, String data) {
         if (rootUri() == null || rel == null) return false;
         try {
-            String parentRel = parentOf(rel);
+            // 只在相对路径里真的有子目录时才补建父目录。
+            // 不要对根目录文件去补建父目录 —— 根目录的上级是授权范围之外的目录。
+            String relParent = parentOf(rel);
             String name = nameOf(rel);
-            String parentId = ensureDir(parentRel);
+            String parentId = ensureDir(relParent);
             if (parentId == null) return false;
 
             byte[] bytes;

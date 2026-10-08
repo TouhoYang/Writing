@@ -160,8 +160,16 @@ public class MainActivity extends Activity {
             if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                 Uri tree = data.getData();
                 fs.saveRoot(tree, lastSegment(tree));
+                // 顺便告诉网页这个目录是否为空(克隆需要一个空目录当仓库根)
+                boolean empty = false;
+                try {
+                    String json = fs.listDirJson("");
+                    empty = json.equals("[]");
+                } catch (Exception ignored) { }
                 emit("pickFolder", ok("{\"uri\":" + js(tree.toString())
-                        + ",\"name\":" + js(fs.rootName()) + ",\"persisted\":true}"));
+                        + ",\"name\":" + js(fs.rootName())
+                        + ",\"persisted\":true"
+                        + ",\"empty\":" + empty + "}"));
             } else {
                 emit("pickFolder", fail("已取消"));
             }

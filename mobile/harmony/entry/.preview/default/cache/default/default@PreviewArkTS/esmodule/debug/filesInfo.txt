@@ -1,0 +1,2 @@
+D:/github_tool/Writing/mobile/harmony/entry/.preview/default/cache/default/default@PreviewArkTS/esmodule/debug/entry/src/main/ets/entryability/EntryAbility.ts;com.touho.writing/entry/ets/entryability/EntryAbility;esm;entry|entry|1.0.0|src/main/ets/entryability/EntryAbility.ts;entry;false;ets
+D:/github_tool/Writing/mobile/harmony/entry/.preview/default/cache/default/default@PreviewArkTS/esmodule/debug/entry/src/main/ets/pages/Index.ts;com.touho.writing/entry/ets/pages/Index;esm;entry|entry|1.0.0|src/main/ets/pages/Index.ts;entry;false;ets

@@ -1,5 +1,5 @@
 import { webview } from '@kit.ArkWeb';
-import { fileIo as fs, picker, fileShare } from '@kit.CoreFileKit';
+import { fileIo as fs, picker, fileShare, fileUri } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
@@ -28,6 +28,8 @@ interface MaziPickResult {
   uri: string;
   name: string;
   persisted: boolean;
+  /** 所选文件夹是否为空(克隆需要一个空目录或新目录作为仓库根) */
+  empty: boolean;
 }
 
 /** 目录列表回传内容 */
@@ -112,6 +114,9 @@ class MaziBridge {
   private rootName: string = '';
   /** Base64 编解码实例(方法是实例方法,不是静态方法) */
   private b64: util.Base64Helper = new util.Base64Helper();
+  /** 最近一次原生文件操作失败的细节(诊断用:克隆失败到底卡在哪个路径/哪个 errno) */
+  private lastErr: string = '';
+  private fsOps: number = 0;
 
   constructor(controller: webview.WebviewController, context: common.UIAbilityContext) {
     this.controller = controller;
@@ -122,6 +127,115 @@ class MaziBridge {
 
   platform(): string {
     return 'harmony';
+  }
+
+  /** 记录一次原生文件操作失败(供网页诊断) */
+  private noteErr(op: string, path: string, e: Object): void {
+    let msg: string = '';
+    try {
+      const be = e as BusinessError;
+      msg = 'code=' + be.code + ' msg=' + be.message;
+    } catch (x) {
+      msg = String(e);
+    }
+    this.fsOps++;
+    this.lastErr = op + ' 失败 @ ' + path + '  (' + msg + ')';
+  }
+
+  /** 诊断:最近一次失败 + 调用次数 */
+  lastNativeErr(): string {
+    const s: string = this.lastErr;
+    this.lastErr = '';
+    return 'root=' + this.rootUri + ' ops=' + this.fsOps + '  ' + (s.length > 0 ? s : '(无失败)');
+  }
+
+  /**
+   * 逐个测试 fileIo 对当前选中 URI 的能力,定位究竟哪一步被系统拒绝。
+   * 背景:同一 URI 上 statSync 成功但 listFileSync/accessSync 报 13900002,
+   * 自相矛盾,需要逐项取证才能确定是「URI 格式」还是「权限」问题。
+   */
+  probeUri(): string {
+    const L: string[] = [];
+    const uri: string = this.rootUri;
+    if (uri.length === 0) {
+      return '(未选定文件夹)';
+    }
+    L.push(' URI=' + uri);
+
+    // 1) 目录自身能否 stat
+    try {
+      const st = fs.statSync(uri);
+      L.push(' stat(目录) = OK  isDir=' + st.isDirectory());
+    } catch (e) {
+      const be = e as BusinessError;
+      L.push(' stat(目录) = 失败 code=' + be.code);
+    }
+
+    // 2) 目录自身能否 open(只读)
+    try {
+      const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      fs.closeSync(f);
+      L.push(' open(目录,READ_ONLY) = OK');
+    } catch (e) {
+      const be = e as BusinessError;
+      L.push(' open(目录,READ_ONLY) = 失败 code=' + be.code + ' ' + be.message);
+    }
+
+    // 3) 新建文件:带 '/' 的完整 URI + CREATE
+    try {
+      const p = uri + '/__p1__.txt';
+      const f = fs.openSync(p, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(f.fd, 'ok');
+      fs.closeSync(f);
+      L.push(' open(uri/子文件, CREATE) = OK   ← 说明这种写法本来可行');
+      try { fs.unlinkSync(p); } catch (e) {}
+    } catch (e) {
+      const be2 = e as BusinessError;
+      L.push(' open(uri/子文件, CREATE) = 失败 code=' + be2.code + ' ' + be2.message);
+    }
+
+    // 4) 不带 TRUNC 的 CREATE
+    try {
+      const p = uri + '/__p2__.txt';
+      const f = fs.openSync(p, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+      fs.closeSync(f);
+      L.push(' open(uri/子文件, CREATE 无 TRUNC) = OK');
+      try { fs.unlinkSync(p); } catch (e) {}
+    } catch (e) {
+      const be3 = e as BusinessError;
+      L.push(' open(uri/子文件, CREATE 无 TRUNC) = 失败 code=' + be3.code);
+    }
+
+    // 5) 创建子目录
+    try {
+      const d = uri + '/__pdir__';
+      fs.mkdirSync(d, true);
+      L.push(' mkdir(uri/子目录) = OK');
+      try { fs.rmdirSync(d); } catch (e) {}
+    } catch (e) {
+      const be4 = e as BusinessError;
+      L.push(' mkdir(uri/子目录) = 失败 code=' + be4.code + ' ' + be4.message);
+    }
+
+    // 6) listFileExt 是否比 listFile 更宽
+    try {
+      const n: string[] = fs.listFileExtSync(uri);
+      L.push(' listFileExt(目录) = OK 条目数=' + n.length);
+    } catch (e) {
+      const be5 = e as BusinessError;
+      L.push(' listFileExt(目录) = 失败 code=' + be5.code);
+    }
+
+    // 7) 用 fileUri 重新构造一次 URI,看是否等价
+    try {
+      const again: string = fileUri.getUriFromPath(uri);
+      L.push(' fileUri.getUriFromPath(uri) = ' + again);
+    } catch (e) {
+      const be6 = e as BusinessError;
+      L.push(' fileUri.getUriFromPath 失败 code=' + be6.code);
+    }
+
+    return L.join('\n');
   }
 
   toast(msg: string): void {
@@ -243,6 +357,31 @@ class MaziBridge {
       this.rootUri = uri;
       this.rootName = this.baseName(uri);
 
+      // 立刻取证:选择器给的 UR 到底能不能访问?不能就说明是 URI/授权的问题,
+      // 而不是后面写文件的逻辑问题 —— 之前这里失败被静默吞掉,查了很久。
+      let probe: string = 'URI=' + uri;
+      try {
+        const names: string[] = fs.listFileSync(uri);
+        probe += ' | listFile OK, 条目数=' + names.length;
+      } catch (e) {
+        const be = e as BusinessError;
+        probe += ' | listFile 失败 code=' + be.code + ' msg=' + be.message;
+      }
+      try {
+        probe += ' | access=' + fs.accessSync(uri);
+      } catch (e) {
+        const be2 = e as BusinessError;
+        probe += ' | access 抛错 code=' + be2.code;
+      }
+      try {
+        const st = fs.statSync(uri);
+        probe += ' | isDir=' + st.isDirectory();
+      } catch (e) {
+        const be3 = e as BusinessError;
+        probe += ' | stat 失败 code=' + be3.code;
+      }
+      this.lastErr = 'pickFolder 取证: ' + probe;
+
       // 尽量把授权持久化,下次启动才能直接访问
       let persisted: boolean = false;
       try {
@@ -269,7 +408,22 @@ class MaziBridge {
         message: persisted ? ('已选定：' + this.rootName) : ('已选定：' + this.rootName + '（本次有效）'),
         duration: 2000
       });
-      const picked: MaziPickResult = { uri: uri, name: this.rootName, persisted: persisted };
+      // 顺便告诉网页这个目录是不是空的(克隆需要一个空目录当仓库根)
+      let isEmpty: boolean = false;
+      try {
+        const names: string[] = fs.listFileSync(uri);
+        let visible: number = 0;
+        for (let i = 0; i < names.length; i++) {
+          const n: string = names[i];
+          if (n.length > 0 && n.charAt(0) !== '.') {
+            visible++;
+          }
+        }
+        isEmpty = (visible === 0);
+      } catch (e) {
+        isEmpty = false;
+      }
+      const picked: MaziPickResult = { uri: uri, name: this.rootName, persisted: persisted, empty: isEmpty };
       this.okData('pickFolder', picked);
     }).catch((err: BusinessError) => {
       if (err !== undefined && err.code !== 13900042) {
@@ -427,7 +581,9 @@ class MaziBridge {
     }
     const target: string = this.abs(rel);
     try {
-      if (fs.accessSync(target)) {
+      // 用 exists() 而不是直接 fs.accessSync:后者在「不存在」时抛异常,
+      // 会让 if 直接跳到 catch,于是永远判不出「已存在」,变成静默覆盖同名文件
+      if (this.exists(target)) {
         this.fail('createFile', '同名文件已存在');
         return;
       }
@@ -532,36 +688,77 @@ class MaziBridge {
     }
   }
 
+  /**
+   * 路径是否已存在。
+   * 注意:fs.accessSync 在「不存在」时是**抛异常**而不是返回 false,
+   * 直接写 if (!fs.accessSync(p)) 会因为异常跳到 catch,导致本该创建的目录没被创建
+   * —— 这是克隆时 .git/objects/xx/yyy 这类多层路径写不进去的根因。
+   */
+  private exists(path: string): boolean {
+    try {
+      return fs.accessSync(path);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 确保某个绝对路径的目录存在(含多层递归创建) */
+  private ensureDirAbs(path: string): boolean {
+    if (path === undefined || path === null || path.length === 0) {
+      return false;
+    }
+    if (this.exists(path)) {
+      return true;
+    }
+    try {
+      fs.mkdirSync(path, true);
+      this.fsOps++;
+      return true;
+    } catch (e) {
+      // 并发/已存在等情况下再确认一次
+      if (this.exists(path)) {
+        return true;
+      }
+      this.noteErr('mkdir', path, e);
+      return false;
+    }
+  }
+
   /** 写文件:data 为 UTF-8 文本,或 "b64:<base64>" */
   gitWrite(rel: string, data: string): boolean {
     if (this.rootUri.length === 0) {
+      this.lastErr = 'gitWrite 失败: 还没选定文件夹';
       return false;
     }
+    let stage: string = 'parent';
+    let target: string = '';
     try {
-      const target: string = this.abs(rel);
-      // 自动补建父目录
-      const i: number = target.lastIndexOf('/');
+      target = this.abs(rel);
+      // 只在「相对路径里真的有子目录」时才补建父目录。
+      // 注意:千万不要对根目录文件也去补建 —— 根目录的上级是授权范围之外的目录,
+      // 对它 mkdir 必然失败(errno 13900002),连根目录文件都会写不进去。
+      const relNorm: string = (rel === undefined || rel === null) ? '' : rel;
+      const i: number = relNorm.lastIndexOf('/');
       if (i > 0) {
-        try {
-          const parent: string = target.substring(0, i);
-          if (!fs.accessSync(parent)) {
-            fs.mkdirSync(parent, true);
-          }
-        } catch (e) {
-          // 已存在等情况忽略
-        }
+        this.ensureDirAbs(this.abs(relNorm.substring(0, i)));
       }
+      stage = 'encode';
       let bytes: Uint8Array;
       if (data !== null && data !== undefined && data.length > 6 && data.substring(0, 4) === 'b64:') {
         bytes = this.b64.decodeSync(data.substring(4));
       } else {
         bytes = new util.TextEncoder().encodeInto(data === undefined || data === null ? '' : data);
       }
+      stage = 'open';
       const file = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      stage = 'write';
       fs.writeSync(file.fd, bytes.buffer);
+      stage = 'close';
       fs.closeSync(file);
+      this.fsOps++;
       return true;
     } catch (e) {
+      this.noteErr('gitWrite[' + stage + ']', target.length > 0 ? target : rel, e);
       return false;
     }
   }
@@ -570,12 +767,12 @@ class MaziBridge {
     if (this.rootUri.length === 0) {
       return false;
     }
+    const relNorm: string = (rel === undefined || rel === null) ? '' : rel;
+    if (relNorm.length === 0) {
+      return true;   // 根目录本来就存在,不需要建
+    }
     try {
-      const target: string = this.abs(rel);
-      if (!fs.accessSync(target)) {
-        fs.mkdirSync(target, true);
-      }
-      return true;
+      return this.ensureDirAbs(this.abs(relNorm));
     } catch (e) {
       return false;
     }
@@ -897,7 +1094,7 @@ struct Index {
             'listDir', 'readText', 'writeText',
             'createFile', 'mkdir', 'remove', 'rename',
             'gitRead', 'gitWrite', 'gitMkdir', 'gitUnlink', 'gitRmdir',
-            'gitReaddir', 'gitStat', 'gitExists', 'gitHttp',
+            'gitReaddir', 'gitStat', 'gitExists', 'gitHttp', 'lastNativeErr', 'probeUri',
             'configLoad', 'configSet', 'configRemove',
             'saveText', 'importFile'
           ],

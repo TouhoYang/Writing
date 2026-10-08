@@ -121,6 +121,12 @@
     background:#fff; border:1px solid var(--line); border-radius:8px;
     padding:8px 10px; min-width:0; flex:1;
   }
+  /* 下拉在 ArkWeb 里需要足够高度/原生外观才好点开 */
+  select.gin{
+    height:38px; min-height:38px; line-height:1.2;
+    -webkit-appearance:menulist; appearance:auto;
+    background-image:none; padding-right:26px;
+  }
   .gin.mono{font-family:ui-monospace,Consolas,monospace; font-size:12px;}
   .glist{max-height:34vh; overflow:auto; margin-top:8px;}
   .gitem{display:flex; align-items:center; gap:8px; padding:9px 6px; border-bottom:1px solid var(--line);}
@@ -228,6 +234,7 @@
         <button id="btnGitAddRepo">用当前文件夹作仓库</button>
         <button id="btnGitInit">init 初始化</button>
         <button id="btnGitOpenFolder">换文件夹</button>
+        <button id="btnGitDiag">诊断信息</button>
       </div>
       <div class="hint" id="gitRepoHint">先把「文件夹」选到一个 Git 仓库目录，再点「用当前文件夹作仓库」。</div>
     </div>
@@ -260,8 +267,9 @@
 
     <div class="gsec">
       <h4>令牌（Personal access token）</h4>
-      <div class="grow">
-        <select class="gin" id="gitTokenSel"></select>
+      <div class="glist" id="gitTokenList"></div>
+      <div class="grow" style="margin-top:8px">
+        <select class="gin" id="gitTokenSel" style="display:none"></select>
       </div>
       <div class="grow">
         <input class="gin" id="gitHost" placeholder="主机名，如 github.com">
@@ -931,7 +939,7 @@ document.getElementById('btnPickFolder').onclick = function(){
       renderTreeRoot();
       var cb = afterPickFolder;
       afterPickFolder = null;
-      if (cb) cb(res.data.name);
+      if (cb) cb(res.data.name, res.data.empty);
     } else if (res && res.error && res.error !== '已取消'){
       elSaved.textContent = res.error;
     }
@@ -1142,32 +1150,187 @@ function getCred(host){
   var c = gitCfg.creds[host];
   return c ? { user: c.user, token: c.token } : null;
 }
+/* 取用于认证的令牌。
+   精确匹配主机名优先;匹配不到时按面板同样的优先级回退:
+   该仓库绑定 -> 唯一保存的令牌 -> 远端主机。
+   这样「主机名填成了邮箱」之类的误填也能救回来,并且会把实际用了哪个令牌记下来。 */
+var lastAuthInfo = '';
+var lastCloneError = '';
 function authFor(url){
   var host = remoteHost(url);
-  var c = host ? getCred(host) : null;
-  if (!c || !c.token) return {};
+  var picked = null, why = '';
+
+  if (host && gitCfg.creds[host]) { picked = host; why = '主机名精确匹配 ' + host; }
+
+  if (!picked){
+    var bound = gitCfg.repoToken[gitRepo === null ? '' : gitRepo];
+    if (bound && gitCfg.creds[bound]) { picked = bound; why = '该仓库绑定的令牌(' + bound + ')'; }
+  }
+  if (!picked){
+    var hosts = Object.keys(gitCfg.creds);
+    if (hosts.length === 1) { picked = hosts[0]; why = '唯一保存的令牌(' + hosts[0] + ')'; }
+  }
+  if (!picked && host){
+    // 主机名后缀匹配,例如 creds 里是 "github.com" 而远端是 "api.github.com"
+    var ks = Object.keys(gitCfg.creds);
+    for (var i = 0; i < ks.length; i++){
+      if (host.indexOf(ks[i]) >= 0 || ks[i].indexOf(host) >= 0) { picked = ks[i]; why = '主机名近似匹配(' + ks[i] + ')'; break; }
+    }
+  }
+
+  lastAuthInfo = '';
+  if (!picked){
+    var all = Object.keys(gitCfg.creds);
+    lastAuthInfo = '未使用认证令牌（已保存 ' + all.length + ' 个：' + (all.length ? all.join(', ') : '无')
+      + (host ? '；远端主机是 ' + host : '') + '）';
+    return {};
+  }
+  var c = gitCfg.creds[picked];
+  if (!c || !c.token){ lastAuthInfo = '令牌为空（' + picked + '）'; return {}; }
+  lastAuthInfo = '使用令牌 ' + why + '，用户名 ' + (c.user || '(空)');
   return { username: c.user || 'x', password: c.token };
 }
+/**
+ * 渲染令牌列表（每条带「填入」与「删除」）。
+ * 移动端 <select> 不好用，而且删除靠「下拉选中项」很容易失败，
+ * 所以换成列表：点哪一条就把它填进输入框，删除按钮直接对应那一条。
+ */
+function renderTokenList(){
+  var box = document.getElementById('gitTokenList');
+  if (!box) return;
+  box.innerHTML = '';
+  var hosts = Object.keys(gitCfg.creds);
+  if (!hosts.length){
+    var e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = '还没有保存任何令牌；在下方填写后点「确认」';
+    box.appendChild(e);
+    return;
+  }
+  hosts.forEach(function(h){
+    var c = gitCfg.creds[h] || {};
+    var row = document.createElement('div');
+    row.className = 'gitem';
+
+    var nm = document.createElement('span');
+    nm.className = 'gp';
+    nm.textContent = h + (c.user ? (' · ' + c.user) : '');
+    row.appendChild(nm);
+
+    var use = document.createElement('button');
+    use.textContent = '填入';
+    use.onclick = function(ev){
+      ev.stopPropagation();
+      document.getElementById('gitHost').value = h;
+      document.getElementById('gitUser').value = c.user || '';
+      document.getElementById('gitToken').value = c.token || '';
+      document.getElementById('gitTokenHint').textContent = '已填入 ' + h + ' 的令牌';
+    };
+    row.appendChild(use);
+
+    var del = document.createElement('button');
+    del.id = 'del_' + h;
+    del.setAttribute('data-armed', '0');
+    del.textContent = '删除';
+    del.onclick = function(ev){
+      ev.stopPropagation();
+      deleteTokenByHost(h);
+    };
+    row.appendChild(del);
+
+    box.appendChild(row);
+  });
+}
+
+/** 按主机名删除令牌(列表里每个删除按钮都走这里) */
+function deleteTokenByHost(h){
+  if (!h || !gitCfg.creds[h]) return;
+  var c = gitCfg.creds[h] || {};
+  /* 不用 confirm:ArkWeb 里 confirm 可能不弹或被吞,表现就是"点了没反应"。
+     改成点两次:第一次把按钮变成确认态。 */
+  var btn = document.getElementById('del_' + h);
+  if (btn && btn.getAttribute('data-armed') !== '1'){
+    btn.setAttribute('data-armed', '1');
+    btn.textContent = '再点一次确认';
+    document.getElementById('gitTokenHint').textContent =
+      '再点一次「再点一次确认」就删除 ' + h;
+    setTimeout(function(){
+      if (btn && btn.getAttribute('data-armed') === '1'){
+        btn.setAttribute('data-armed', '0');
+        btn.textContent = '删除';
+      }
+    }, 4000);
+    return;
+  }
+
+  delete gitCfg.creds[h];
+  var stale = [];
+  Object.keys(gitCfg.repoToken).forEach(function(k){
+    if (gitCfg.repoToken[k] === h) stale.push(k);
+  });
+  stale.forEach(function(k){ delete gitCfg.repoToken[k]; });
+  saveGitCfg();
+
+  /* 关键:删除后必须把新值显式写回原生。
+     启动时是「原生优先覆盖 localStorage」,
+     只改 localStorage 的话下次启动会把删掉的又灌回来。 */
+  var vmsg = '';
+  try {
+    if (hasNativeConfig()){
+      nativeConfigSet('mazi_git_v1', JSON.stringify(gitCfg));
+      var raw = window.MaziHarmony.configLoad();
+      var obj = raw ? JSON.parse(raw) : {};
+      var now = obj['mazi_git_v1'] ? JSON.parse(obj['mazi_git_v1']) : null;
+      var still = (now && now.creds && now.creds[h]) ? '仍在' : '已移除';
+      vmsg = ' · 本机配置校验: ' + still
+        + ' · 剩余: ' + ((now && now.creds) ? (Object.keys(now.creds).join(', ') || '(无)') : '(无)');
+    }
+  } catch (e) {
+    vmsg = ' · 校验异常: ' + e.message;
+  }
+  reloadTokenSel('');
+  renderTokenList();
+  document.getElementById('gitTokenHint').textContent = '已删除 ' + h + ' 的令牌' + vmsg
+    + ' · 剩余列表: ' + (Object.keys(gitCfg.creds).join(', ') || '(空)');
+}
+
+/**
+ * 重建令牌下拉。
+ * 关键:永远至少有一个可选项 —— 否则 select 展不开,用户既看不到令牌也删不掉。
+ * selectKey === undefined 时默认选中第一项;传 '' 表示选中「说明项」(并清空输入框);
+ * 传具体主机名则选中该主机。自动载入逻辑统一走 autoSelectToken(),不在这里做。
+ */
 function reloadTokenSel(selectKey){
   var sel = document.getElementById('gitTokenSel');
   sel.innerHTML = '';
+
   var hosts = Object.keys(gitCfg.creds);
-  if (!hosts.length){ var o = document.createElement('option'); o.value = ''; o.textContent = '（还没有保存的令牌）'; sel.appendChild(o); return; }
-  var first = null;
+  var first = document.createElement('option');
+  first.value = '';
+  first.textContent = hosts.length
+    ? '— 选择已保存的令牌 —'
+    : '— 还没有保存的令牌，请在下方填写后点「确认」 —';
+  sel.appendChild(first);
+
   hosts.forEach(function(h){
     var c = gitCfg.creds[h];
     var o = document.createElement('option');
     o.value = h;
     o.textContent = tokenKey(h, c.user || '');
     sel.appendChild(o);
-    if (!first) first = h;
   });
-  var want = selectKey || first;
+
+  var want;
+  if (selectKey === undefined || selectKey === null) { want = hosts.length ? hosts[0] : ''; }
+  else { want = selectKey; }
   for (var i = 0; i < sel.options.length; i++){
     if (sel.options[i].value === want){ sel.selectedIndex = i; break; }
   }
   fillTokenFields();
+  renderTokenList();
 }
+
+/** 把当前选中项的令牌填进三个输入框;选中说明项则清空 */
 function fillTokenFields(){
   var sel = document.getElementById('gitTokenSel');
   var h = sel.value;
@@ -1199,7 +1362,7 @@ function autoSelectToken(url){
     hint.textContent = '已按远端主机 ' + host + ' 自动选用令牌';
     return;
   }
-  reloadTokenSel(null);
+  reloadTokenSel('');
   if (!hosts.length){
     hint.textContent = '还没有保存任何令牌（仅私有仓库需要）';
   } else {
@@ -1229,7 +1392,7 @@ function gitRefreshRepoList(){
   var sel = document.getElementById('gitRepo');
   sel.innerHTML = '';
   if (!gitCfg.repos.length){
-    var o = document.createElement('option'); o.value = ''; o.textContent = '（还没有添加仓库）'; sel.appendChild(o);
+    var o = document.createElement('option'); o.value = ''; o.textContent = '— 还没有仓库，请先克隆或用当前文件夹作仓库 —'; sel.appendChild(o);
     return;
   }
   gitCfg.repos.forEach(function(r){
@@ -1459,24 +1622,123 @@ document.getElementById('btnGitTokenSave').onclick = function(){
   saveGitCfg();
   rememberToken(gitRepo);
   reloadTokenSel(host);
-  document.getElementById('gitTokenHint').textContent = '已保存令牌：' + tokenKey(host, user);
+
+  /* 立刻回读原生配置,确认真的落盘了(而不是只写进了内存里的对象) */
+  var verify = '';
+  try {
+    if (hasNativeConfig()){
+      var raw = window.MaziHarmony.configLoad();
+      var obj = raw ? JSON.parse(raw) : {};
+      var saved = obj['mazi_git_v1'] ? JSON.parse(obj['mazi_git_v1']) : null;
+      var okHost = saved && saved.creds && saved.creds[host] && saved.creds[host].token === token;
+      verify = okHost ? ' · 已写入本机配置(重启不丢)' : ' · ⚠ 原生配置里没找到,可能没落盘';
+    } else {
+      verify = ' · 浏览器环境,只存在浏览器里';
+    }
+  } catch (e) {
+    verify = ' · 回读校验异常: ' + e.message;
+  }
+  document.getElementById('gitTokenHint').textContent = '已保存令牌：' + tokenKey(host, user) + verify;
 };
 
 document.getElementById('btnGitTokenDel').onclick = function(){
-  var sel = document.getElementById('gitTokenSel');
-  var h = sel.value;
-  if (!h || !gitCfg.creds[h]){ return; }
-  if (!confirm('删除 ' + tokenKey(h, gitCfg.creds[h].user || '') + ' 的令牌？')) return;
-  delete gitCfg.creds[h];
-  /* 清理指向该主机(或已失效)的仓库绑定 */
-  var stale = [];
-  Object.keys(gitCfg.repoToken).forEach(function(k){
-    if (gitCfg.repoToken[k] === h) stale.push(k);
-  });
-  stale.forEach(function(k){ delete gitCfg.repoToken[k]; });
-  saveGitCfg();
-  reloadTokenSel(null);
-  document.getElementById('gitTokenHint').textContent = '已删除该令牌，相关仓库绑定也已清除';
+  /* 保留作为快捷方式:优先删当前输入框里的主机;
+     没填且只有一个令牌就删它。 */
+  var typed = (document.getElementById('gitHost').value || '').trim().toLowerCase();
+  var hosts = Object.keys(gitCfg.creds);
+  var h = '';
+  if (typed && gitCfg.creds[typed]) h = typed;
+  else if (hosts.length === 1) h = hosts[0];
+  if (!h){
+    document.getElementById('gitTokenHint').textContent = hosts.length
+      ? '填上要删除的主机名，或直接点上面列表里对应的「删除」'
+      : '还没有保存任何令牌';
+    return;
+  }
+  deleteTokenByHost(h);
+};
+
+/* ---------- 诊断信息:一次性打印关键状态 ---------- */
+document.getElementById('btnGitDiag').onclick = function(){
+  var L = [];
+  L.push('=== 写作 Git 诊断 ===');
+  L.push('时间: ' + new Date().toLocaleString('zh-CN', {hour12:false}));
+  L.push('平台: ' + (window.MaziHarmony ? (window.MaziHarmony.platform ? window.MaziHarmony.platform() : 'harmony?') : '浏览器'));
+  L.push('原生配置桥: ' + (hasNativeConfig() ? '有' : '无'));
+  L.push('已选文件夹: ' + (treeRoot ? treeRoot.name : '(未选)'));
+  L.push('当前仓库 dir: "' + (gitRepo === null ? '(null)' : gitRepo) + '"');
+  L.push('仓库列表: ' + JSON.stringify(gitCfg.repos));
+  L.push('令牌主机列表: ' + (Object.keys(gitCfg.creds).join(', ') || '(无)'));
+  L.push('仓库→令牌绑定: ' + JSON.stringify(gitCfg.repoToken));
+  L.push('本次认证: ' + (lastAuthInfo || '(未发生)'));
+  if (lastCloneError) L.push('上次克隆错误: ' + lastCloneError);
+
+  /* 原生文件系统最近一次失败(克隆卡在哪一步的关键线索) */
+  try {
+    if (window.MaziHarmony && window.MaziHarmony.lastNativeErr){
+      var ne = window.MaziHarmony.lastNativeErr();
+      L.push('原生最近失败: ' + (ne && ne !== '' ? ne : '(无)'));
+    }
+  } catch (e) { L.push('原生最近失败读取异常: ' + e.message); }
+
+  /* 自检:真的往目标目录写一个嵌套文件 —— 这正是克隆失败的同一个动作。
+     以前只看状态,看不出"写不进去";现在直接写一次,成败立判。 */
+  try {
+    var H = window.MaziHarmony;
+    if (H && H.gitWrite){
+      L.push('--- 写路径自检 ---');
+      var t1 = H.gitWrite('__probe__.txt', 'ok');
+      L.push(' 写根目录文件: ' + t1 + (t1 ? '' : '   ← 根目录都写不进去,说明授权/目录本身有问题'));
+      var t2 = H.gitWrite('__probeDir__/a/b.txt', 'ok');
+      L.push(' 写嵌套 __probeDir__/a/b.txt: ' + t2 + (t2 ? '' : '   ← 多层目录创建有问题'));
+      L.push(' 回读根文件: ' + JSON.stringify(H.gitRead('__probe__.txt')));
+      L.push(' 回读嵌套文件: ' + JSON.stringify(H.gitRead('__probeDir__/a/b.txt')));
+      try { L.push(' 自检后原生失败记录: ' + H.lastNativeErr()); } catch (e2) {}
+      try { H.gitUnlink('__probe__.txt'); } catch (e3) {}
+      try { H.gitUnlink('__probeDir__/a/b.txt'); } catch (e4) {}
+      try { H.gitRmdir('__probeDir__/a'); } catch (e5) {}
+      try { H.gitRmdir('__probeDir__'); } catch (e6) {}
+    }
+  } catch (e) { L.push('写路径自检异常: ' + e.message); }
+
+  /* 追加取证:逐个测试 fileIo 对选中 URI 的各项能力,看究竟哪一步被拒 */
+  try {
+    if (window.MaziHarmony && window.MaziHarmony.probeUri){
+      L.push('--- URI 能力取证 ---');
+      L.push(window.MaziHarmony.probeUri());
+    }
+  } catch (e) { L.push('URI 能力取证异常: ' + e.message); }
+
+  /* 看一眼目标目录到底有没有东西 */
+  if (window.MaziHarmony && window.MaziHarmony.gitReaddir){
+    try {
+      L.push('根目录条目: ' + window.MaziHarmony.gitReaddir(''));
+    } catch (e) { L.push('根目录读取异常: ' + e.message); }
+    try { L.push(' .git 存在: ' + window.MaziHarmony.gitExists('.git')); } catch (e) {}
+    try {
+      var g = window.MaziHarmony.gitReaddir('.git');
+      L.push(' .git 内容: ' + g);
+      L.push(' refs 内容: ' + window.MaziHarmony.gitReaddir('.git/refs'));
+    } catch (e) { L.push(' .git 读取异常: ' + e.message); }
+  } else {
+    L.push('(无原生文件桥)');
+  }
+
+  /* 原生配置里到底存了什么键 */
+  try {
+    if (hasNativeConfig()){
+      var raw = window.MaziHarmony.configLoad();
+      var obj = raw ? JSON.parse(raw) : {};
+      L.push('原生配置键: ' + Object.keys(obj).join(', '));
+      if (obj['mazi_git_v1']){
+        var gg = JSON.parse(obj['mazi_git_v1']);
+        L.push('原生中的令牌主机: ' + (Object.keys(gg.creds || {}).join(', ') || '(无)'));
+      }
+    }
+  } catch (e) { L.push('原生配置读取异常: ' + e.message); }
+
+  gitSay(L.join('\n'));
+  cloneHint('诊断已输出到下方「输出」');
 };
 
 
@@ -1507,47 +1769,99 @@ document.getElementById('btnGitClone').onclick = function(){
   var url = document.getElementById('gitCloneUrl').value.trim();
   if (!url){ alert('请先填写仓库链接，例如 https://github.com/用户名/仓库名.git'); return; }
   if (!validRepoUrl(url)){
-    alert('链接格式无法识别。\n请使用 https://… 、git@… 或 ssh://…\n（手机内置的是 https，SSH 需要额外配置）');
+    alert('链接格式无法识别。\n请使用 https://… 、git@… 或 ssh://…');
     return;
   }
-  cloneHint('正在选择目标文件夹…');
-  /* 选完后在回调里克隆;仓库名取自所选文件夹名 */
-  afterPickFolder = function(pickedName){
+  cloneHint('正在选择仓库文件夹…');
+  /* 所选文件夹就是仓库根目录(等价于 git clone <url> .)。
+     不再在里面多套一层同名子目录 —— 之前那样会把内容克隆到 Github/Github。 */
+  afterPickFolder = function(pickedName, isEmpty){
     openSheet('gitSheet');
-    doClone(url, pickedName || repoNameFromUrl(url));
+    if (isEmpty === false){
+      if (window.MaziHarmony.gitExists && window.MaziHarmony.gitExists('.git')){
+        /* 已经是个仓库:登记并拉取 */
+        gitSay('该文件夹已经是一个 Git 仓库，改为「登记并拉取」。');
+        if (gitCfg.repos.indexOf('') < 0) gitCfg.repos.push('');
+        gitRepo = '';
+        saveGitCfg();
+        gitRefreshAll();
+        gitPull();
+        return;
+      }
+      cloneHint('文件夹不是空的');
+      gitSay('所选文件夹不是空的，无法作为新仓库的根目录。'
+        + '\n请改选一个空文件夹（或先新建一个空文件夹）。');
+      return;
+    }
+    doClone(url, '');
   };
   document.getElementById('btnPickFolder').click();
 };
 
-/* 真正克隆到 仓库根/<name> */
-function doClone(url, name){
+/** 从当前仓库根拉取 */
+function gitPull(){
+  gitRun('pull', function(fs, http){
+    var url = null;
+    return git.listRemotes({ fs: fs, dir: gitRepo }).then(function(rs){
+      url = rs && rs[0] ? rs[0].url : null;
+      if (!url) throw new Error('该仓库没有配置远端（remote）');
+      var auth = authFor(url);
+      return git.pull({
+        fs: fs, http: http, dir: gitRepo, singleBranch: true,
+        author: gitAuthor(),
+        onAuth: function(){ return auth; }
+      });
+    });
+  }).then(function(){
+    gitRefreshAll();
+    if (curRelPath) openTreeFile(curRelPath);
+  }).catch(function(){});
+}
+
+/* 真正把仓库克隆到「当前选定的文件夹根目录」;dir 为空字符串表示根目录本身 */
+function doClone(url, dir){
+  var key = (dir === undefined || dir === null) ? '' : dir;
+  var target = (key === '') ? '(当前文件夹)' : key;
   cloneHint('克隆中…（大仓库可能要几分钟，请勿退出）');
-  gitSay('开始克隆 ' + url + '\n目标目录: ' + name + ' …');
+  gitSay('开始克隆 ' + url + '\n目标目录: ' + target + ' …');
   var auth = authFor(url);
+  gitSay('认证: ' + (lastAuthInfo || '(无)'));
   var fs = gitFs(), http = gitHttp();
 
   git.clone({
     fs: fs,
     http: http,
-    dir: name,
+    dir: key,
     url: url,
     singleBranch: true,
     depth: 1,
     author: gitAuthor(),
     onAuth: function(){ return auth; }
   }).then(function(){
-    if (gitCfg.repos.indexOf(name) < 0) gitCfg.repos.push(name);
-    gitRepo = name;
+    if (gitCfg.repos.indexOf(key) < 0) gitCfg.repos.push(key);
+    gitRepo = key;
     var h = remoteHost(url);
-    if (h) gitCfg.repoToken[name] = h;
+    if (h) gitCfg.repoToken[key] = h;
     saveGitCfg();
-    cloneHint('已克隆到 ' + name);
-    gitSay('克隆完成 → ' + name);
+    cloneHint('已克隆到 ' + target);
+    gitSay('克隆完成 → ' + target);
     gitRefreshAll();
   }).catch(function(e){
-    cloneHint('克隆失败');
-    gitSay('克隆失败：' + (e && e.message ? e.message : e)
-      + '\n若为私有仓库，请先在下方保存该主机（' + (remoteHost(url) || '主机') + '）的访问令牌后重试。');
+    var host = remoteHost(url) || '(未知主机)';
+    var detail = [
+      '克隆失败：' + (e && e.message ? e.message : e),
+      '仓库地址: ' + url,
+      '远端主机: ' + host,
+      '认证情况: ' + (lastAuthInfo || '(未知)'),
+      '已保存令牌的主机: ' + (Object.keys(gitCfg.creds).join(', ') || '(无)')
+    ].join('\n');
+    lastCloneError = detail;
+    cloneHint('克隆失败（详情见下方「输出」）');
+    gitSay(detail
+      + '\n\n排查建议：'
+      + '\n· 主机名要填 github.com（不是邮箱、不带 https://）'
+      + '\n· 私有仓库需要 PAT，且要有 repo 权限'
+      + '\n· 需要认证时统一用 HTTPS 地址');
   });
 }
 
@@ -1594,6 +1908,9 @@ function boot(){
   applySettings();
   openDoc(curId);
   updateStats();
+  /* 首屏就要把已保存的令牌列出来(之前只在 reloadTokenSel 里渲染,启动路径调用不到) */
+  if (typeof renderTokenList === 'function') renderTokenList();
+  if (typeof reloadTokenSel === 'function') reloadTokenSel('');
   if (window.MaziAndroid && window.MaziAndroid.platform){
     elSaved.textContent = "安卓版 · 已就绪";
   } else if (window.MaziHarmony && window.MaziHarmony.platform){
