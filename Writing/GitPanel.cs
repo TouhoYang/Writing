@@ -220,7 +220,7 @@ namespace Writing
         ListBox _repoList;
         TextBlock _statusText, _commitInfo, _remoteText, _changesHeader, _historyHeader;
         ComboBox _branchBox, _tokenCombo;
-        TextBox _msgBox, _logBox, _hostBox, _userBox;
+        TextBox _msgBox, _logBox, _hostBox, _userBox, _cloneUrlBox;
         PasswordBox _tokenBox;
         ListBox _changesList, _historyList;
         Button _addBtn, _removeBtn, _treeBtn, _refreshBtn, _switchBtn, _pullBtn, _commitBtn, _pushBtn, _tokenSaveBtn, _tokenDelBtn;
@@ -378,6 +378,31 @@ namespace Writing
             _treeBtn.HorizontalAlignment = HorizontalAlignment.Left;
             lb2.Children.Add(_treeBtn);
             lp.Children.Add(lb2);
+
+            // 克隆:填仓库链接 → 选文件夹 → 拉取内容
+            StackPanel lb3 = new StackPanel();
+            lb3.Margin = new Thickness(10, 0, 10, 10);
+            DockPanel.SetDock(lb3, Dock.Bottom);
+            TextBlock cloneTitle = new TextBlock();
+            cloneTitle.Text = "克隆仓库（填链接 → 选文件夹 → 拉取内容）";
+            cloneTitle.FontSize = 12;
+            cloneTitle.Foreground = Res("FgSoft", Color.FromRgb(0x79, 0x81, 0x8C));
+            cloneTitle.Margin = new Thickness(0, 0, 0, 6);
+            cloneTitle.TextWrapping = TextWrapping.Wrap;
+            lb3.Children.Add(cloneTitle);
+            _cloneUrlBox = DarkInput(double.NaN, 0);
+            _cloneUrlBox.FontSize = 12;
+            AutomationProperties.SetName(_cloneUrlBox, "GitCloneUrl");
+            lb3.Children.Add(_cloneUrlBox);
+            StackPanel cloneBtns = new StackPanel();
+            cloneBtns.Orientation = Orientation.Horizontal;
+            cloneBtns.Margin = new Thickness(0, 6, 0, 0);
+            Button cloneBtn = PrimaryBtn("选择文件夹并克隆", Clone_Click);
+            cloneBtn.Margin = new Thickness(0);
+            AutomationProperties.SetName(cloneBtn, "GitCloneButton");
+            cloneBtns.Children.Add(cloneBtn);
+            lb3.Children.Add(cloneBtns);
+            lp.Children.Add(lb3);
 
             _repoList = new ListBox();
             _repoList.BorderThickness = new Thickness(0);
@@ -659,6 +684,151 @@ namespace Writing
                 ReloadRepoList(dir);
                 Log("已添加仓库: " + dir);
             }
+        }
+
+        // 克隆:仓库链接 → 选文件夹 → 拉取内容
+        void Clone_Click(object sender, RoutedEventArgs e)
+        {
+            if (_busy) { Log("已有操作正在执行，请稍候…"); return; }
+
+            string url = _cloneUrlBox.Text.Trim();
+            if (url.Length == 0)
+            {
+                Log("请先在左侧填写仓库链接，例如 https://github.com/用户名/仓库名.git");
+                _cloneUrlBox.Focus();
+                return;
+            }
+
+            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("git@", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+            {
+                Log("仓库链接格式无法识别，请使用 https://… 、git@… 或 ssh://…");
+                return;
+            }
+
+            // 先看是否已经克隆过同一个远端，避免重复拉一份
+            string existing = FindRepoByUrl(url);
+            if (existing != null)
+            {
+                Log("该链接已经克隆过，直接切换到已有仓库: " + existing);
+                ReloadRepoList(existing);
+                RunOne("拉取", existing, "pull --ff-only", AuthForUrl(url), true);
+                return;
+            }
+
+            string parent, folderName;
+            using (System.Windows.Forms.FolderBrowserDialog dlg = new System.Windows.Forms.FolderBrowserDialog())
+            {
+                dlg.Description = "选择克隆到的文件夹（会被 git 用作仓库根目录）";
+                dlg.ShowNewFolderButton = true;
+                if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+                string picked = dlg.SelectedPath;
+
+                bool exists = Directory.Exists(picked);
+                if (exists)
+                {
+                    try
+                    {
+                        if (Directory.GetFileSystemEntries(picked).Length > 0)
+                        {
+                            Log("所选文件夹不是空的: " + picked);
+                            Log("请选一个空文件夹（或新建一个），克隆需要自己创建仓库内容。");
+                            return;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("无法读取所选文件夹：" + ex.Message);
+                        return;
+                    }
+                    // 空文件夹:删掉,c 让 git clone 自己创建,兼容各版本 git 对已存在目录的处理
+                    try { Directory.Delete(picked, false); }
+                    catch (Exception ex)
+                    {
+                        Log("无法清空空文件夹以用于克隆：" + ex.Message);
+                        return;
+                    }
+                }
+
+                parent = Path.GetDirectoryName(picked);
+                folderName = Path.GetFileName(picked);
+                if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(folderName))
+                {
+                    Log("请直接选择「某个文件夹」作为仓库根目录（不要选盘符根目录）。");
+                    return;
+                }
+            }
+
+            string target = Path.Combine(parent, folderName);
+            Log("开始克隆 " + url + " → " + target);
+            Log("提示: 私有仓库请先在下方保存对应主机的访问令牌。");
+            _busy = true;
+            SetBusy(true);
+            string auth = AuthForUrl(url);
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                // 在父目录里用裸仓库名克隆,这样 git 能自己创建目标目录
+                GitResult r = GitRunner.Run(parent, "clone " + GitRunner.Quote(url) + " " + GitRunner.Quote(folderName), auth, 900000);
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+                {
+                    if (r.Output.Length > 0) Log(r.Output);
+                    _busy = false;
+                    SetBusy(false);
+                    if (!r.Ok)
+                    {
+                        Log("[失败] 克隆（退出码 " + r.ExitCode + "）");
+                        return;
+                    }
+                    Log("[完成] 克隆到 " + target);
+                    List<string> list = RepoPaths();
+                    if (!list.Contains(target)) list.Add(target);
+                    SaveRepos(list);
+                    ReloadRepoList(target);
+                    RefreshStatus();
+                    _owner.RefreshGitStatus();
+                }));
+            });
+        }
+
+        // 按远端地址找已添加的仓库
+        string FindRepoByUrl(string url)
+        {
+            string want = NormalizeUrl(url);
+            foreach (string repo in RepoPaths())
+            {
+                string have = GitRunner.RemoteUrl(repo);
+                if (have.Length > 0 && NormalizeUrl(have) == want) return repo;
+            }
+            return null;
+        }
+
+        // 比较远端地址时忽略大小写、结尾的 / 与 .git
+        static string NormalizeUrl(string url)
+        {
+            if (url == null) return "";
+            string s = url.Trim().ToLowerInvariant();
+            while (s.EndsWith("/")) s = s.Substring(0, s.Length - 1);
+            if (s.EndsWith(".git")) s = s.Substring(0, s.Length - 4);
+            while (s.EndsWith("/")) s = s.Substring(0, s.Length - 1);
+            return s;
+        }
+
+        // 克隆时还没有仓库目录,只能按链接里的主机取令牌
+        string AuthForUrl(string url)
+        {
+            string host = GitRunner.HostOf(url);
+            if (host == null) return null;
+            string u, tk;
+            if (GetCred(host, out u, out tk))
+            {
+                Log("使用已保存的 " + host + " 访问令牌进行认证。");
+                return GitRunner.BasicHeader(u, tk);
+            }
+            Log("提示: 未保存 " + host + " 的访问令牌，若远端需要认证请在下方添加 PAT 并「确认」。");
+            return null;
         }
 
         void RemoveRepo_Click(object sender, RoutedEventArgs e)

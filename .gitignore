@@ -1,8 +1,21 @@
 # 写作 Writing —— 版本库忽略规则
 
 # 构建工具链：不入库，需要时运行 mobile\获取安卓SDK.ps1 按需下载（解压后约 347 MB）
+# 这个目录永远不要提交：里面还有打包用的 debug.keystore 签名密钥
 mobile/android-sdk/
+android-sdk/
 mobile/build/
+
+# 鸿蒙构建产物与缓存
+mobile/harmony/entry/build/
+mobile/harmony/.hvigor/
+mobile/harmony/.appanalyzer/
+.hvigor/
+.appanalyzer/
+oh_modules/
+
+# 安卓构建时会自动生成(由 mobile\index.html 拷贝而来),不入库免得来回改动
+mobile/android/assets/
 
 # 打包中间产物 / 签名附加文件
 *.idsig

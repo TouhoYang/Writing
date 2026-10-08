@@ -11,6 +11,14 @@
     {
       "name": "EntryAbility_label",
       "value": "写作"
+    },
+    {
+      "name": "reason_file_access_persist",
+      "value": "用于长期读写你选定的稿件文件夹（如本地 Git 仓库目录）"
+    },
+    {
+      "name": "reason_internet",
+      "value": "用于访问 Git 仓库（拉取、推送、查看历史）"
     }
   ]
 }
