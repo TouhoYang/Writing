@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Automation;
@@ -36,6 +37,15 @@ namespace Writing
         TreeView _tree;
         string _treeRootPath = null;
         string _selectedDir = null;
+
+        // 多文档(标签页):每个 txt 一个 DocTab,同一时刻只有当前标签的内容驻留在 _editor 中,
+        // 其余标签的内容保存在 DocTab.Text 里。切换标签时与 _editor 互相同步,并保留光标与滚动位置。
+        StackPanel _tabStrip;
+        ScrollViewer _tabScroll;
+        TextBlock _tabCountText;
+        readonly List<DocTab> _tabs = new List<DocTab>();
+        DocTab _activeTab = null;
+        bool _syncingEditor = false;
         TextBlock _folderText;
         TextBlock _fontSizeText;
         TextBlock _fileNameText;
@@ -54,9 +64,6 @@ namespace Writing
 
         // 状态
         AppSettings _settings = new AppSettings();
-        string _currentFile = null;
-        string _fileEncoding = "utf-8";
-        bool _dirty = false;
         bool _loading = false;
         bool _applyingIndent = false;
         bool _skipIndentOnce = false;
@@ -86,8 +93,11 @@ namespace Writing
         DispatcherTimer _autoSaveTimer;
         DispatcherTimer _boundsTimer;
         DispatcherTimer _treeStateTimer;
-        readonly HashSet<string> _expandedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+        DispatcherTimer _treeWatchTimer;             // 目录变化合并延时(实时刷新目录树)
+        DispatcherTimer _gitStatusTimer;             // git 状态合并延时
+        FileSystemWatcher _watcher;
+        string _watchRoot = null;
+        string _lastSavedPath = null;                // 本程序最近一次写盘的文件(用于区分"自己写"与"外部改动")
         // 自绘滚动条(系统 ScrollBar 在长文本下滑块会被 Track 裁成几个像素)
         Canvas _scrollCanvas;
         Border _scrollThumb;
@@ -96,6 +106,29 @@ namespace Writing
         double _scrollDragStartY = 0;
         double _scrollDragStartOffset = 0;
         const double MinThumbHeight = 40;
+
+        readonly HashSet<string> _expandedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<TreeViewItem, string> _nodeStamps = new Dictionary<TreeViewItem, string>();
+        HashSet<string> _dirtyDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // 当前标签的只读/读写代理:保持原有单文档逻辑的书写方式
+        string _currentFile
+        {
+            get { return _activeTab == null ? null : _activeTab.Path; }
+            set { if (_activeTab != null) _activeTab.Path = value; }
+        }
+
+        string _fileEncoding
+        {
+            get { return _activeTab == null ? "utf-8" : _activeTab.Encoding; }
+            set { if (_activeTab != null) _activeTab.Encoding = value; }
+        }
+
+        bool _dirty
+        {
+            get { return _activeTab != null && _activeTab.Dirty; }
+            set { if (_activeTab != null) _activeTab.Dirty = value; }
+        }
 
         public MainWindow()
         {
@@ -142,7 +175,7 @@ namespace Writing
             _clockTimer.Tick += delegate { _clockText.Text = DateTime.Now.ToString("HH:mm:ss"); };
             _clockTimer.Start();
 
-            // 自动保存:每 3 分钟
+            // 自动保存:每 3 分钟(所有已命名且有改动的标签都会写盘)
             _autoSaveTimer = new DispatcherTimer();
             _autoSaveTimer.Interval = TimeSpan.FromSeconds(180);
             _autoSaveTimer.Tick += delegate
@@ -150,6 +183,24 @@ namespace Writing
                 if (_dirty && _currentFile != null) SaveToFile();
             };
             _autoSaveTimer.Start();
+
+            // 目录变化合并:文件系统事件通常成串到达,静默 220ms 后再统一同步一次目录树
+            _treeWatchTimer = new DispatcherTimer();
+            _treeWatchTimer.Interval = TimeSpan.FromMilliseconds(220);
+            _treeWatchTimer.Tick += delegate { _treeWatchTimer.Stop(); SyncTree(); };
+
+            // git 状态合并:目录树刷新后隔一拍再查 git,避免频繁起进程
+            _gitStatusTimer = new DispatcherTimer();
+            _gitStatusTimer.Interval = TimeSpan.FromMilliseconds(600);
+            _gitStatusTimer.Tick += delegate
+            {
+                _gitStatusTimer.Stop();
+                RefreshGitStatus();
+            };
+
+            // 启动时先建一个空白的"未命名"标签,可直接开写
+            NewEmptyTab();
+            ApplyTabBarState();
 
             // 恢复上次的目录树状态(用户选择的根目录 + 展开层级 + 选中目录)
             string lastRoot = _settings.TreeRoot;
@@ -164,6 +215,13 @@ namespace Writing
                 OpenFolder(lastRoot, false);
                 RestoreTreeState();
             }
+
+            // 回到前台时核对一次:目录树立即同步,已打开的文档若被外部改写则提示/重载
+            Activated += delegate
+            {
+                ScheduleTreeSync();
+                CheckExternalChanges();
+            };
 
             ContentRendered += delegate { _editor.Focus(); };
 
@@ -417,12 +475,20 @@ namespace Writing
 
         FrameworkElement BuildEditorArea()
         {
+            DockPanel col = new DockPanel();
+            col.LastChildFill = true;
+
+            FrameworkElement tabBar = BuildTabBar();
+            DockPanel.SetDock(tabBar, Dock.Top);
+            col.Children.Add(tabBar);
+
             _editorHost = new Border();
             _editorHost.Background = Res("White", Colors.White);
             _editorHost.CornerRadius = new CornerRadius(10);
             _editorHost.BorderBrush = Res("Line", Color.FromRgb(0xE9, 0xEB, 0xEF));
             _editorHost.BorderThickness = new Thickness(1);
-            _editorHost.Margin = new Thickness(12, 12, 14, 12);
+            _editorHost.Margin = new Thickness(12, 4, 14, 12);
+            col.Children.Add(_editorHost);
 
             Grid host = new Grid();
             _editorHost.Child = host;
@@ -476,7 +542,395 @@ namespace Writing
                 UpdateScrollIndicator();
             };
 
-            return _editorHost;
+            return col;
+        }
+
+        // ---------- 多文档标签栏 ----------
+
+        // 标签栏:文件名标签(可点选、中键/×关闭) + 新建按钮 + 左右切换 + 数量
+        FrameworkElement BuildTabBar()
+        {
+            Border bar = new Border();
+            bar.Background = Res("StatusBg", Colors.White);
+            bar.BorderBrush = Res("Line", Color.FromRgb(0xE9, 0xEB, 0xEF));
+            bar.BorderThickness = new Thickness(0, 0, 0, 1);
+            bar.Padding = new Thickness(8, 5, 8, 0);
+
+            DockPanel dp = new DockPanel();
+            dp.LastChildFill = true;
+            bar.Child = dp;
+
+            // 右侧固定区:新建 + 左右切换 + 标签数
+            StackPanel right = new StackPanel();
+            right.Orientation = Orientation.Horizontal;
+            right.VerticalAlignment = VerticalAlignment.Center;
+            right.Margin = new Thickness(8, 0, 0, 5);
+            DockPanel.SetDock(right, Dock.Right);
+
+            Button add = new Button();
+            add.Content = "+";
+            add.ToolTip = "新建文档（Ctrl+N）";
+            add.FontSize = 15;
+            add.Padding = new Thickness(9, 0, 9, 2);
+            add.VerticalAlignment = VerticalAlignment.Center;
+            add.Click += delegate { NewEmptyTab(); };
+            right.Children.Add(add);
+
+            Button prev = new Button();
+            prev.Content = "‹";
+            prev.ToolTip = "上一个文档（Ctrl+Tab）";
+            prev.FontSize = 14;
+            prev.Padding = new Thickness(8, 1, 8, 2);
+            prev.VerticalAlignment = VerticalAlignment.Center;
+            prev.Click += delegate { CycleTab(-1); };
+            right.Children.Add(prev);
+
+            Button next = new Button();
+            next.Content = "›";
+            next.ToolTip = "下一个文档（Ctrl+Tab）";
+            next.FontSize = 14;
+            next.Padding = new Thickness(8, 1, 8, 2);
+            next.VerticalAlignment = VerticalAlignment.Center;
+            next.Click += delegate { CycleTab(1); };
+            right.Children.Add(next);
+
+            _tabCountText = new TextBlock();
+            _tabCountText.Text = "";
+            _tabCountText.FontSize = 11;
+            _tabCountText.Foreground = Res("FgFaint", Color.FromRgb(0xA8, 0xAE, 0xB8));
+            _tabCountText.VerticalAlignment = VerticalAlignment.Center;
+            _tabCountText.Margin = new Thickness(6, 0, 2, 0);
+            right.Children.Add(_tabCountText);
+            dp.Children.Add(right);
+
+            // 左侧可滚动标签区
+            _tabScroll = new ScrollViewer();
+            _tabScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden;
+            _tabScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Disabled;
+            _tabScroll.PreviewMouseWheel += TabScroll_MouseWheel;
+
+            _tabStrip = new StackPanel();
+            _tabStrip.Orientation = Orientation.Horizontal;
+            _tabStrip.VerticalAlignment = VerticalAlignment.Bottom;
+            _tabScroll.Content = _tabStrip;
+            dp.Children.Add(_tabScroll);
+
+            // 空白处双击 = 新建文档
+            _tabScroll.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                if (e.ClickCount == 2 && object.ReferenceEquals(e.OriginalSource, _tabScroll))
+                {
+                    NewEmptyTab();
+                }
+            };
+
+            return bar;
+        }
+
+        void TabScroll_MouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (_tabScroll == null) return;
+            _tabScroll.ScrollToHorizontalOffset(_tabScroll.HorizontalOffset - e.Delta);
+            e.Handled = true;
+        }
+
+        // 重建标签栏(标签数量很少,整体重建最简单也最不容易出错)
+        void ApplyTabBarState()
+        {
+            if (_tabStrip == null) return;
+            _tabStrip.Children.Clear();
+            foreach (DocTab tab in _tabs)
+            {
+                _tabStrip.Children.Add(MakeTabItem(tab));
+            }
+            _tabCountText.Text = _tabs.Count > 1 ? ("共 " + _tabs.Count + " 个") : "";
+            if (_activeTab != null) ScrollTabIntoView(_activeTab);
+        }
+
+        void UpdateTabHeader(DocTab tab)
+        {
+            // 标签数量少时精确刷新单个标签,避免整体重建打断鼠标交互
+            ApplyTabBarState();
+        }
+
+        FrameworkElement MakeTabItem(DocTab tab)
+        {
+            bool active = object.ReferenceEquals(tab, _activeTab);
+
+            Border item = new Border();
+            item.Height = 30;
+            item.Margin = new Thickness(0, 0, 4, -1);
+            item.Padding = new Thickness(11, 0, 5, 0);
+            item.CornerRadius = new CornerRadius(7, 7, 0, 0);
+            item.Background = active ? Res("AccentSoft", Color.FromRgb(0xEB, 0xF1, 0xFD)) : Brushes.Transparent;
+            item.BorderThickness = new Thickness(0, 0, 0, 2);
+            item.BorderBrush = active ? Res("Accent", Color.FromRgb(0x2F, 0x6F, 0xEB)) : Brushes.Transparent;
+            item.Cursor = Cursors.Hand;
+            item.ToolTip = tab.Path == null ? "未保存的新文档" : tab.Path;
+            item.Tag = tab;
+            item.MouseLeftButtonDown += TabItem_MouseDown;
+            item.MouseDown += TabItem_MouseDown2;
+            item.MouseEnter += delegate
+            {
+                if (!object.ReferenceEquals(tab, _activeTab)) item.Background = Res("Hover", Color.FromRgb(0xF2, 0xF4, 0xF7));
+            };
+            item.MouseLeave += delegate
+            {
+                if (!object.ReferenceEquals(tab, _activeTab)) item.Background = Brushes.Transparent;
+            };
+
+            Grid g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition());
+            ColumnDefinition closeCol = new ColumnDefinition();
+            closeCol.Width = GridLength.Auto;
+            g.ColumnDefinitions.Add(closeCol);
+
+            TextBlock name = new TextBlock();
+            name.Text = tab.DisplayName;
+            name.FontSize = 12.5;
+            name.TextTrimming = TextTrimming.CharacterEllipsis;
+            name.MaxWidth = 170;
+            name.VerticalAlignment = VerticalAlignment.Center;
+            name.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
+            name.Foreground = active
+                ? Res("AccentText", Color.FromRgb(0x2F, 0x6F, 0xEB))
+                : Res("FgSoft", Color.FromRgb(0x79, 0x81, 0x8C));
+            Grid.SetColumn(name, 0);
+            g.Children.Add(name);
+
+            Button close = new Button();
+            close.Content = "×";
+            close.FontSize = 13;
+            close.Padding = new Thickness(5, 0, 5, 1);
+            close.VerticalAlignment = VerticalAlignment.Center;
+            close.ToolTip = "关闭（Ctrl+W）";
+            close.Foreground = active
+                ? Res("AccentText", Color.FromRgb(0x2F, 0x6F, 0xEB))
+                : Res("FgFaint", Color.FromRgb(0xA8, 0xAE, 0xB8));
+            close.Tag = tab;
+            close.Click += delegate(object s, RoutedEventArgs e)
+            {
+                e.Handled = true;
+                CloseTab(tab);
+            };
+            Grid.SetColumn(close, 1);
+            g.Children.Add(close);
+
+            item.Child = g;
+            return item;
+        }
+
+        void TabItem_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            Border b = sender as Border;
+            if (b == null) return;
+            DocTab tab = b.Tag as DocTab;
+            if (tab == null || object.ReferenceEquals(tab, _activeTab)) return;
+            SelectTab(tab);
+        }
+
+        // 中键关闭标签
+        void TabItem_MouseDown2(object sender, MouseButtonEventArgs e)
+        {
+            if (e.ChangedButton != MouseButton.Middle) return;
+            Border b = sender as Border;
+            if (b == null) return;
+            DocTab tab = b.Tag as DocTab;
+            if (tab != null) CloseTab(tab);
+            e.Handled = true;
+        }
+
+        void ScrollTabIntoView(DocTab tab)
+        {
+            if (_tabStrip == null) return;
+            foreach (object o in _tabStrip.Children)
+            {
+                Border b = o as Border;
+                if (b == null || !object.ReferenceEquals(b.Tag, tab)) continue;
+                try { b.BringIntoView(); } catch { }
+                return;
+            }
+        }
+
+        // ---------- 标签页管理 ----------
+
+        // 新建一个空白的"未命名"标签并切换过去
+        void NewEmptyTab()
+        {
+            DocTab tab = new DocTab();
+            _tabs.Add(tab);
+            SelectTab(tab);
+            if (_editor != null) _editor.Focus();
+        }
+
+        // 切换标签:先把当前编辑框的内容与光标位置写回旧标签,再把新标签内容装进编辑框
+        void SelectTab(DocTab tab)
+        {
+            if (tab == null) return;
+            if (object.ReferenceEquals(tab, _activeTab))
+            {
+                ApplyTabBarState();
+                if (_editor != null) _editor.Focus();
+                return;
+            }
+            DocTab old = _activeTab;
+            if (old != null)
+            {
+                old.Text = _editor.Text;
+                old.CaretIndex = _editor.CaretIndex;
+                old.ScrollOffset = _contentScroll == null ? 0 : _contentScroll.VerticalOffset;
+            }
+
+            // 装载期间屏蔽 TextChanged 的"变脏/统计"处理(文本内容本身已由 Text 赋值同步)
+            _loading = true;
+            _syncingEditor = true;
+            _activeTab = tab;
+            _editor.Text = tab.Text;
+            _syncingEditor = false;
+            _loading = false;
+
+            if (tab.CaretIndex >= 0 && tab.CaretIndex <= _editor.Text.Length) _editor.CaretIndex = tab.CaretIndex;
+            _editor.IsUndoEnabled = false;      // 清空撤销栈:切换文档后 Ctrl+Z 只作用于当前文档
+            _editor.IsUndoEnabled = true;
+            _typedSinceLastTick = 0;
+            _speedEma = 0;
+            _lastTypeTick = 0;
+            RestoreScrollOffset(tab.ScrollOffset);
+
+            _encText.Text = TextEncodingHelper.DisplayName(_fileEncoding);
+            _saveStateText.Text = "就绪";
+            ApplyTabBarState();
+            UpdateTitle();
+            UpdateStats();
+            UpdateSpeed();
+            CheckExternalChanges();
+        }
+
+        // delta = +1 下一个标签,-1 上一个标签
+        void CycleTab(int delta)
+        {
+            if (_tabs.Count <= 1 || _activeTab == null) return;
+            int idx = _tabs.IndexOf(_activeTab);
+            if (idx < 0) idx = 0;
+            int next = (idx + delta) % _tabs.Count;
+            if (next < 0) next += _tabs.Count;
+            SelectTab(_tabs[next]);
+        }
+
+        // 关闭标签:未保存的改动先按"已命名自动保存 / 未命名询问"的既有规则处理
+        void CloseTab(DocTab tab)
+        {
+            if (tab == null) return;
+            if (!ConfirmCloseTab(tab)) return;
+
+            int idx = _tabs.IndexOf(tab);
+            bool wasActive = object.ReferenceEquals(tab, _activeTab);
+
+            if (wasActive)
+            {
+                // 先把编辑框内容写回该标签,避免把当前正在编辑的内容丢掉
+                tab.Text = _editor.Text;
+                _activeTab = null;               // 防止 _dirty 代理误标到别的标签
+                tab.Dirty = false;
+            }
+            _tabs.Remove(tab);
+
+            if (_tabs.Count == 0)
+            {
+                NewEmptyTab();
+            }
+            else if (wasActive)
+            {
+                if (idx >= _tabs.Count) idx = _tabs.Count - 1;
+                if (idx < 0) idx = 0;
+                SelectTab(_tabs[idx]);
+            }
+            else
+            {
+                ApplyTabBarState();
+            }
+        }
+
+        // 关闭标签前的确认:已命名的自动保存;未命名且有内容时询问
+        bool ConfirmCloseTab(DocTab tab)
+        {
+            string text = object.ReferenceEquals(tab, _activeTab) ? _editor.Text : tab.Text;
+            if (!tab.Dirty && tab.Path != null) return true;
+            if (tab.Path != null)
+            {
+                if (object.ReferenceEquals(tab, _activeTab)) SaveToFile();
+                else SaveTabSilently(tab, text);
+                return !tab.Dirty;
+            }
+            if (string.IsNullOrEmpty(text) || TextStats.TotalChars(text) == 0) return true;
+            MessageBoxResult r = MessageBox.Show(this,
+                "“" + tab.DisplayName + "”还没有保存成文件，关闭后内容会丢失。要先保存吗？",
+                "写作", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes)
+            {
+                if (object.ReferenceEquals(tab, _activeTab))
+                {
+                    SaveToFile();
+                    return !tab.Dirty;
+                }
+                SaveFileDialog dlg = new SaveFileDialog();
+                dlg.Filter = "文本文件 (*.txt)|*.txt";
+                dlg.FileName = tab.DisplayName;
+                if (dlg.ShowDialog(this) != true) return false;
+                tab.Path = dlg.FileName;
+                tab.Encoding = "utf-8";
+                SaveTabSilently(tab, text);
+                return !tab.Dirty;
+            }
+            return r == MessageBoxResult.No;
+        }
+
+        // 把某个非当前标签的内容静默写盘(用于自动保存与关闭其它标签前保存)
+        void SaveTabSilently(DocTab tab, string text)
+        {
+            if (tab == null || tab.Path == null) return;
+            try
+            {
+                byte[] bytes = TextEncodingHelper.Encode(NormalizeNewlines(text), tab.Encoding);
+                _lastSavedPath = tab.Path;
+                File.WriteAllBytes(tab.Path, bytes);
+                tab.Dirty = false;
+                tab.Stamp = StampOf(tab.Path);
+            }
+            catch (Exception ex)
+            {
+                ShowError("保存失败：" + ex.Message);
+            }
+        }
+
+        // 关闭窗口:所有已命名且有改动的标签先保存;当前标签若是未命名的则询问
+        void SaveAllBeforeClose(out bool cancel)
+        {
+            cancel = false;
+            if (_activeTab != null) _activeTab.Text = _editor.Text;
+            foreach (DocTab tab in _tabs)
+            {
+                if (!tab.Dirty || tab.Path == null) continue;
+                if (object.ReferenceEquals(tab, _activeTab)) SaveToFile();
+                else SaveTabSilently(tab, tab.Text);
+                if (tab.Dirty && object.ReferenceEquals(tab, _activeTab)) { cancel = true; return; }
+            }
+            if (_activeTab == null || !_activeTab.Dirty) return;
+            // 仅当前标签可能是"未命名的脏文档"(其它标签切走时已保存)
+            string text = _activeTab.Text;
+            if (string.IsNullOrEmpty(text) || TextStats.TotalChars(text) == 0) return;
+            MessageBoxResult r = MessageBox.Show(this,
+                "文档“" + _activeTab.DisplayName + "”尚未保存，要保存吗？", "写作",
+                MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes)
+            {
+                SaveToFile();
+                if (_dirty) cancel = true;
+            }
+            else if (r == MessageBoxResult.Cancel)
+            {
+                cancel = true;
+            }
         }
 
         // 依据 ScrollViewer 的视口/内容比例更新自绘滚动条
@@ -926,6 +1380,7 @@ namespace Writing
                 _folderText.Text = path;
                 _folderText.ToolTip = path;
                 RebuildTree();
+                StartWatching(path);          // 目录内容变化时自动刷新目录树
                 RefreshGitStatus();
             }
             catch (Exception ex)
@@ -995,27 +1450,315 @@ namespace Writing
         {
             if (_treeRootPath != null && Directory.Exists(_treeRootPath))
             {
-                RebuildTree();
-                RefreshGitStatus();
+                SyncTree();
             }
             else
             {
+                StopWatching();
+                _nodeStamps.Clear();
+                _dirtyDirs.Clear();
                 _tree.Items.Clear();
                 _treeRootPath = null;
                 _folderText.Text = "（未选择文件夹）";
             }
         }
 
+        // ---------- 目录实时刷新(文件系统监视) ----------
+
+        // 文件系统事件成串到达,这里只记一次并合并到 220ms 后统一同步
+        void ScheduleTreeSync()
+        {
+            if (_treeWatchTimer == null || _treeRootPath == null) return;
+            _treeWatchTimer.Stop();
+            _treeWatchTimer.Start();
+        }
+
+        void StartWatching(string root)
+        {
+            if (string.IsNullOrEmpty(root)) return;
+            if (string.Equals(_watchRoot, root, StringComparison.OrdinalIgnoreCase) && _watcher != null) return;
+            StopWatching();
+            try
+            {
+                FileSystemWatcher w = new FileSystemWatcher(root);
+                w.IncludeSubdirectories = true;
+                w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size;
+                w.Changed += Watch_Event;
+                w.Created += Watch_Event;
+                w.Deleted += Watch_Event;
+                w.Renamed += Watch_Renamed;
+                w.Error += Watch_Error;
+                w.EnableRaisingEvents = true;
+                _watcher = w;
+                _watchRoot = root;
+            }
+            catch
+            {
+                // 目录过大/无权限等:退回手动「刷新」按钮
+                _watcher = null;
+                _watchRoot = null;
+            }
+        }
+
+        void StopWatching()
+        {
+            FileSystemWatcher w = _watcher;
+            _watcher = null;
+            _watchRoot = null;
+            if (w == null) return;
+            try
+            {
+                w.EnableRaisingEvents = false;
+                w.Changed -= Watch_Event;
+                w.Created -= Watch_Event;
+                w.Deleted -= Watch_Event;
+                w.Renamed -= Watch_Renamed;
+                w.Error -= Watch_Error;
+                w.Dispose();
+            }
+            catch { }
+        }
+
+        void Watch_Event(object sender, FileSystemEventArgs e)
+        {
+            if (!IsRelevantWatchPath(e.FullPath)) return;
+            MarkTreeDirty(e.FullPath, false);
+            ScheduleTreeSync();
+        }
+
+        void Watch_Renamed(object sender, RenamedEventArgs e)
+        {
+            if (!IsRelevantWatchPath(e.FullPath) && !IsRelevantWatchPath(e.OldFullPath)) return;
+            MarkTreeDirty(e.OldFullPath, false);
+            MarkTreeDirty(e.FullPath, false);
+            ScheduleTreeSync();
+        }
+
+        void Watch_Error(object sender, ErrorEventArgs e)
+        {
+            // 缓冲区溢出等:重建监视器并做一次全量同步,避免漏掉改动
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+            {
+                string root = _watchRoot;
+                StopWatching();
+                if (root != null) StartWatching(root);
+                MarkTreeDirty(root, true);
+                ScheduleTreeSync();
+            }));
+        }
+
+        // 记下确实变动的目录:同步时只重扫这些层,大目录树也不会因为一次改动而全树遍历
+        void MarkTreeDirty(string path, bool includeSelf)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    _dirtyDirs.Add(path);
+                    if (!includeSelf)
+                    {
+                        // 目录自身的时间戳变了,但它的父目录列表并没有变化,父层不必重扫
+                        return;
+                    }
+                }
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) _dirtyDirs.Add(dir);
+            }
+            catch { }
+        }
+
+        // 只关心 .txt 文件与目录本身,其它扩展名的写入不触发刷新
+        static bool IsRelevantWatchPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            try
+            {
+                if (Directory.Exists(path)) return true;
+            }
+            catch { }
+            if (path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return true;
+            // 刚被删除的路径已不存在,按"有无扩展名"判断
+            return !Path.HasExtension(path);
+        }
+
+        // 目录变化后的增量同步:只重扫发生变化的目录所在的那一层,
+        // 能原地保留的节点保持不动(不打断展开状态与选中)
+        void SyncTree()
+        {
+            if (_tree == null || _treeRootPath == null) return;
+            if (!Directory.Exists(_treeRootPath))
+            {
+                StopWatching();
+                _nodeStamps.Clear();
+                _tree.Items.Clear();
+                _treeRootPath = null;
+                _folderText.Text = "（目录已不存在）";
+                return;
+            }
+            if (_tree.Items.Count == 0)
+            {
+                RebuildTree();
+                return;
+            }
+            TreeViewItem root = _tree.Items[0] as TreeViewItem;
+            if (root == null || root.Tag == null)
+            {
+                RebuildTree();
+                return;
+            }
+            string rootTag = root.Tag as string;
+            if (rootTag == null || !rootTag.StartsWith("D|") ||
+                !string.Equals(rootTag.Substring(2), _treeRootPath, StringComparison.OrdinalIgnoreCase))
+            {
+                RebuildTree();
+                return;
+            }
+
+            // 取出本次待同步的目录集合(事件在同步期间可能继续到达,先换一个新的空集合)
+            HashSet<string> dirs = _dirtyDirs;
+            _dirtyDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 根目录自身的内容变化同样要看到:例如在根目录下新建/删除文件
+            dirs.Add(_treeRootPath);
+
+            SyncNode(root, dirs, 0);
+
+            // 清理已经不存在、但仍留在"已展开"集合里的目录
+            List<string> gone = new List<string>();
+            foreach (string dir in _expandedDirs)
+            {
+                try { if (!Directory.Exists(dir)) gone.Add(dir); }
+                catch { gone.Add(dir); }
+            }
+            foreach (string dir in gone) _expandedDirs.Remove(dir);
+
+            ApplyGitStatusToTree();
+            CheckExternalChanges();
+            UpdateTitle();
+            ScheduleGitStatusRefresh();
+        }
+
+        // 递归同步:只在 dirs 命中该节点所在目录时重扫这一层,
+        // 折叠的子树不加载也不遍历(展开时自然会重新扫描)
+        void SyncNode(TreeViewItem node, HashSet<string> dirs, int depth)
+        {
+            if (node == null || depth > 24 || node.Tag == null) return;
+            string tag = node.Tag as string;
+            if (tag == null || !tag.StartsWith("D|")) return;
+            string dir = tag.Substring(2);
+
+            if (dirs.Contains(dir)) UpdateChildrenInPlace(node, dir);
+
+            foreach (object o in node.Items)
+            {
+                TreeViewItem child = o as TreeViewItem;
+                if (child == null || !child.IsExpanded) continue;
+                SyncNode(child, dirs, depth + 1);
+            }
+        }
+
+        void ScheduleGitStatusRefresh()
+        {
+            if (_gitStatusTimer == null) return;
+            _gitStatusTimer.Stop();
+            _gitStatusTimer.Start();
+        }
+
         void RebuildTree()
         {
             if (_tree == null || _treeRootPath == null) return;
+            _nodeStamps.Clear();
+            _dirtyDirs.Clear();
             _tree.Items.Clear();
             string name = Path.GetFileName(_treeRootPath);
             if (string.IsNullOrEmpty(name)) name = _treeRootPath;
             TreeViewItem root = MakeDirNode(name, _treeRootPath);
+            SetNodeStamp(root, _treeRootPath);
             _tree.Items.Add(root);
             LoadChildrenInto(root, _treeRootPath);
             root.IsExpanded = true;
+        }
+
+        // 原地更新某一层的子节点:内容变了才重建这一层,否则一个节点都不动
+        void UpdateChildrenInPlace(TreeViewItem dirNode, string dir)
+        {
+            List<string> dirs = new List<string>();
+            List<string> files = new List<string>();
+            try
+            {
+                foreach (string d in Directory.GetDirectories(dir))
+                {
+                    string dn = Path.GetFileName(d);
+                    if (string.Equals(dn, ".git", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(dn, ".svn", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(dn, ".hg", StringComparison.OrdinalIgnoreCase)) continue;
+                    dirs.Add(d);
+                }
+            }
+            catch { }
+            try
+            {
+                foreach (string f in Directory.GetFiles(dir, "*.txt")) files.Add(f);
+            }
+            catch { }
+
+            if (EntriesUnchanged(dirNode, dirs, files)) return;
+
+            // 目录内容确实变了:只重建这一层,展开的子目录在重建后恢复展开
+            HashSet<string> wasExpanded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (object o in dirNode.Items)
+            {
+                TreeViewItem ti = o as TreeViewItem;
+                if (ti == null) continue;
+                string t = ti.Tag as string;
+                if (t != null && t.StartsWith("D|") && ti.IsExpanded) wasExpanded.Add(t.Substring(2));
+                ForgetNodeStamp(ti);      // 该节点连同子树一起作废
+            }
+
+            dirNode.Items.Clear();
+            LoadChildrenInto(dirNode, dir);
+            foreach (object o in dirNode.Items)
+            {
+                TreeViewItem ti = o as TreeViewItem;
+                if (ti == null || ti.Tag == null) continue;
+                string t = ti.Tag as string;
+                if (t != null && t.StartsWith("D|") && wasExpanded.Contains(t.Substring(2))) ti.IsExpanded = true;
+            }
+        }
+
+        // 这一层的条目与现有节点是否完全一致(含各条目的时间戳)
+        bool EntriesUnchanged(TreeViewItem dirNode, List<string> dirs, List<string> files)
+        {
+            int expected = dirs.Count + files.Count;
+            if (dirNode.Items.Count != expected)
+            {
+                // 条目数相同也可能只是"空目录提示"之类的占位节点,按实际节点数核对
+                int real = 0;
+                foreach (object o in dirNode.Items)
+                {
+                    if (o is TreeViewItem) real++;
+                }
+                if (real != expected) return false;
+            }
+
+            Dictionary<string, string> expect = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string d in dirs) expect[d] = "1";
+            foreach (string f in files) expect[f] = "1";
+
+            foreach (object o in dirNode.Items)
+            {
+                TreeViewItem child = o as TreeViewItem;
+                if (child == null) return false;
+                string tag = child.Tag as string;
+                if (tag == null || tag.Length < 2) return false;
+                if (tag == "PLACEHOLDER" || tag == "EMPTY" || tag == "MORE") return false;
+                string path = tag.Substring(2);
+                if (!expect.ContainsKey(path)) return false;
+                expect.Remove(path);
+                if (GetNodeStamp(child) != StampOf(path)) return false;
+            }
+            return expect.Count == 0;
         }
 
         TreeViewItem MakeDirNode(string name, string fullPath)
@@ -1023,6 +1766,7 @@ namespace Writing
             TreeViewItem node = new TreeViewItem();
             node.Header = MakeDirHeader(name, DirHasChanges(fullPath));
             node.Tag = "D|" + fullPath;
+            SetNodeStamp(node, fullPath);
             node.FontWeight = FontWeights.SemiBold;
             node.Selected += DirNode_Selected;
             node.Expanded += DirNode_Expanded;
@@ -1042,6 +1786,7 @@ namespace Writing
             string status = _gitStatuses.TryGetValue(path, out letter) ? letter : "";
             node.Header = MakeFileHeader(Path.GetFileName(path), status);
             node.Tag = "F|" + path;
+            SetNodeStamp(node, path);
             node.Foreground = string.IsNullOrEmpty(status)
                 ? Res("FgSoft", Color.FromRgb(0x79, 0x81, 0x8C))
                 : StatusBrushFor(status);
@@ -1655,55 +2400,92 @@ namespace Writing
             return full;
         }
 
+        // 打开(或切换到)一个文档:已打开的文档直接切到它的标签,否则新开一个标签
         public void LoadFile(string path)
         {
-            if (!ConfirmSaveBeforeSwitch(path)) return;
+            if (string.IsNullOrEmpty(path)) return;
+
+            // 已经打开过:切过去,不做磁盘重载(避免打断已有内容)
+            DocTab existing = FindTab(path);
+            if (existing != null)
+            {
+                SelectTab(existing);
+                if (_treeRootPath != null) SelectFileInTree(path);
+                return;
+            }
+
+            byte[] bytes;
+            string encName;
+            string text;
             try
             {
-                byte[] bytes = File.ReadAllBytes(path);
-                string encName;
-                string text = TextEncodingHelper.Decode(bytes, out encName);
+                bytes = File.ReadAllBytes(path);
+                text = TextEncodingHelper.Decode(bytes, out encName);
+            }
+            catch (Exception ex)
+            {
+                ShowError("打开失败：" + ex.Message);
+                return;
+            }
 
+            // 复用当前这个空白的"未命名"标签,避免打开一个文件就多出一个空标签
+            DocTab tab = _activeTab;
+            if (tab == null || tab.Path != null || !string.IsNullOrEmpty(tab.Text))
+            {
+                tab = new DocTab();
+                _tabs.Add(tab);
+            }
+
+            tab.Path = path;
+            tab.Encoding = encName;
+            tab.Text = text;
+            tab.Dirty = false;
+            tab.Stamp = StampOf(path);
+            tab.CaretIndex = 0;
+            tab.ScrollOffset = 0;
+
+            bool wasActive = object.ReferenceEquals(tab, _activeTab);
+            if (wasActive)
+            {
+                // 通过 SelectTab 装载会重新取一次磁盘内容;这里直接自行装载更省事
                 _loading = true;
-                // 清空撤销栈:否则 Ctrl+Z 会撤销掉"设置文本"这一步,表现为回退到上一个文件
-                bool undoWasEnabled = _editor.IsUndoEnabled;
-                _editor.IsUndoEnabled = false;
+                _syncingEditor = true;
                 _editor.Text = text;
-                _editor.IsUndoEnabled = undoWasEnabled;
+                _syncingEditor = false;
                 _loading = false;
-
-                _currentFile = path;
-                _fileEncoding = encName;
-                _dirty = false;
+                _editor.IsUndoEnabled = false;      // 清空撤销栈,避免 Ctrl+Z 回退到上一个文档
+                _editor.IsUndoEnabled = true;
+                _editor.CaretIndex = 0;
                 // 已码字数与按键次数为应用生命周期累计,切换文档不清零
                 _typedSinceLastTick = 0;
                 _speedEma = 0;
                 _lastTypeTick = 0;
-
-                string dir = Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
-                {
-                    _currentFolder = dir;
-                    if (_treeRootPath == null || !IsUnderRoot(path))
-                    {
-                        // 文件不在当前目录树内:本次会话临时以该目录为根,不覆盖用户记忆的目录树
-                        OpenFolder(dir, false);
-                    }
-                    SelectFileInTree(path);
-                }
-
                 _encText.Text = TextEncodingHelper.DisplayName(encName);
                 _saveStateText.Text = "已打开 " + DateTime.Now.ToString("HH:mm:ss");
-                UpdateTitle();
-                UpdateStats();
-                UpdateSpeed();
-                _editor.Focus();
+                RestoreScrollOffset(0);
             }
-            catch (Exception ex)
+            else
             {
-                _loading = false;
-                ShowError("打开失败：" + ex.Message);
+                SelectTab(tab);
             }
+
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+            {
+                _currentFolder = dir;
+                if (_treeRootPath == null || !IsUnderRoot(path))
+                {
+                    // 文件不在当前目录树内:本次会话临时以该目录为根,不覆盖用户记忆的目录树
+                    OpenFolder(dir, false);
+                }
+                SelectFileInTree(path);
+            }
+
+            ApplyTabBarState();
+            UpdateTitle();
+            UpdateStats();
+            UpdateSpeed();
+            _editor.Focus();
         }
 
         // 切换文档前处理当前文档的未保存改动:
@@ -1729,10 +2511,23 @@ namespace Writing
             return r == MessageBoxResult.No;
         }
 
+        // 按路径查找已打开的标签
+        DocTab FindTab(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            foreach (DocTab t in _tabs)
+            {
+                if (t.Path != null && string.Equals(t.Path, path, StringComparison.OrdinalIgnoreCase)) return t;
+            }
+            return null;
+        }
+
         void SaveToFile()
         {
             try
             {
+                if (_activeTab == null) return;
+                _activeTab.Text = NormalizeNewlines(_editor.Text);
                 if (_currentFile == null)
                 {
                     SaveFileDialog dlg = new SaveFileDialog();
@@ -1742,10 +2537,12 @@ namespace Writing
                     _currentFile = dlg.FileName;
                     _fileEncoding = "utf-8";
                 }
-                string text = NormalizeNewlines(_editor.Text);
-                byte[] bytes = TextEncodingHelper.Encode(text, _fileEncoding);
+                byte[] bytes = TextEncodingHelper.Encode(_activeTab.Text, _fileEncoding);
+                _lastSavedPath = _currentFile;
                 File.WriteAllBytes(_currentFile, bytes);
-                _dirty = false;
+                _activeTab.Dirty = false;
+                _activeTab.Stamp = StampOf(_currentFile);
+                ApplyTabBarState();
                 UpdateTitle();
                 _encText.Text = TextEncodingHelper.DisplayName(_fileEncoding);
                 _saveStateText.Text = "已保存 " + DateTime.Now.ToString("HH:mm:ss");
@@ -1762,6 +2559,105 @@ namespace Writing
             t = t.Replace("\r", "\n");
             t = t.Replace("\n", "\r\n");
             return t;
+        }
+
+        // ---------- 多文档辅助 ----------
+
+        // 文件时间戳(用于判断磁盘上的内容是否被外部改动)
+        static string StampOf(string path)
+        {
+            try { return File.Exists(path) ? File.GetLastWriteTimeUtc(path).Ticks.ToString(CultureInfo.InvariantCulture) : (Directory.Exists(path) ? Directory.GetLastWriteTimeUtc(path).Ticks.ToString(CultureInfo.InvariantCulture) : ""); }
+            catch { return ""; }
+        }
+
+        // 目录树节点的时间戳(用于增量比对):单独存字典,不放在节点上,避免刷新时被重建的 Header 影响
+        string GetNodeStamp(TreeViewItem node)
+        {
+            string v;
+            return _nodeStamps.TryGetValue(node, out v) ? v : "";
+        }
+
+        void SetNodeStamp(TreeViewItem node, string path)
+        {
+            _nodeStamps[node] = StampOf(path);
+        }
+
+        void ForgetNodeStamp(TreeViewItem node)
+        {
+            if (node == null) return;
+            // 连同子树一起移除,避免时间戳表里留下已经丢弃的节点
+            foreach (object o in node.Items)
+            {
+                TreeViewItem child = o as TreeViewItem;
+                if (child != null) ForgetNodeStamp(child);
+            }
+            _nodeStamps.Remove(node);
+        }
+
+        // 恢复编辑区的滚动位置(等测量完成后再设置,否则长文本会被夹到旧范围)
+        void RestoreScrollOffset(double offset)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(delegate
+            {
+                try
+                {
+                    if (_contentScroll != null && offset > 0) _contentScroll.ScrollToVerticalOffset(offset);
+                }
+                catch { }
+                UpdateScrollIndicator();
+            }));
+        }
+
+        // 核对已打开文档在磁盘上的状态:
+        // - 文件被删除:只提示,标签内容保留(可另存为)
+        // - 无本地未保存改动且磁盘更新时间变了:自动重新载入
+        void CheckExternalChanges()
+        {
+            if (_tabs.Count == 0) return;
+            bool savedByUs = _lastSavedPath != null;
+            _lastSavedPath = null;
+            DocTab active = _activeTab;
+            if (active != null && active.Path != null)
+            {
+                if (!File.Exists(active.Path))
+                {
+                    SetSaveState("源文件已被删除：" + Path.GetFileName(active.Path));
+                }
+                else if (!savedByUs && !active.Dirty)
+                {
+                    string stamp = StampOf(active.Path);
+                    if (stamp.Length > 0 && stamp != active.Stamp)
+                    {
+                        LoadFile(active.Path);
+                        SetSaveState("检测到外部改动，已重新载入 " + DateTime.Now.ToString("HH:mm:ss"));
+                    }
+                }
+            }
+            // 后台标签(没有本地改动)同样核对
+            List<DocTab> stale = new List<DocTab>();
+            foreach (DocTab t in _tabs)
+            {
+                if (object.ReferenceEquals(t, active)) continue;
+                if (t.Path == null || t.Dirty) continue;
+                string stamp = StampOf(t.Path);
+                if (stamp.Length > 0 && stamp != t.Stamp) stale.Add(t);
+            }
+            foreach (DocTab t in stale)
+            {
+                try
+                {
+                    string encName;
+                    t.Text = TextEncodingHelper.Decode(File.ReadAllBytes(t.Path), out encName);
+                    t.Encoding = encName;
+                    t.Stamp = StampOf(t.Path);
+                }
+                catch { }
+            }
+        }
+
+        void SetSaveState(string message)
+        {
+            if (_saveStateText != null) _saveStateText.Text = message;
         }
 
         void Tree_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -1786,6 +2682,10 @@ namespace Writing
 
         void Editor_TextChanged(object sender, TextChangedEventArgs e)
         {
+            // 切换/装载文档时,编辑器内容由代码赋值,不属于用户编辑,不计入改动与统计
+            if (_syncingEditor) return;
+            if (_activeTab == null) return;
+            _activeTab.Text = _editor.Text;
             if (_loading || _applyingIndent) return;
 
             // 自动缩进:检测到刚插入的换行且光标紧跟其后,在光标处追加两个全角空格。
@@ -1823,6 +2723,7 @@ namespace Writing
             {
                 _dirty = true;
                 UpdateTitle();
+                ApplyTabBarState();
             }
             UpdateStats();
         }
@@ -1903,6 +2804,30 @@ namespace Writing
                 SaveToFile();
                 e.Handled = true;
             }
+            else if (e.Key == Key.N && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                NewEmptyTab();
+                e.Handled = true;
+            }
+            else if (e.Key == Key.W && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                CloseTab(_activeTab);
+                e.Handled = true;
+            }
+            // Ctrl+Tab / Ctrl+Shift+Tab:在已打开的文档之间切换
+            else if (e.Key == Key.Tab && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+            {
+                CycleTab((Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift ? -1 : 1);
+                e.Handled = true;
+            }
+            // Ctrl+1..8:切到第 N 个文档
+            else if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control &&
+                     e.Key >= Key.D1 && e.Key <= Key.D8)
+            {
+                int idx = e.Key - Key.D1;
+                if (idx < _tabs.Count) SelectTab(_tabs[idx]);
+                e.Handled = true;
+            }
             else if (e.Key == Key.F2)
             {
                 // F2:重命名目录树中选中的 txt 文件
@@ -1967,41 +2892,38 @@ namespace Writing
         void Window_Drop(object sender, DragEventArgs e)
         {
             string[] files = e.Data.GetData(DataFormats.FileDrop) as string[];
-            if (files != null && files.Length > 0)
+            if (files == null || files.Length == 0) return;
+            // 拖入多个文件:每个都在自己的标签里打开;拖入目录则作为目录树根
+            foreach (string p in files)
             {
-                string p = files[0];
-                if (Directory.Exists(p)) OpenFolder(p);
-                else if (File.Exists(p)) LoadFile(p);
+                try
+                {
+                    if (Directory.Exists(p)) OpenFolder(p);
+                    else if (File.Exists(p) && !IsSamePathOpen(p)) LoadFile(p);
+                }
+                catch { }
             }
+        }
+
+        bool IsSamePathOpen(string path)
+        {
+            return FindTab(path) != null;
         }
 
         void Window_Closing(object sender, CancelEventArgs e)
         {
             SaveWindowBounds();
             SaveTreeState();
+            StopWatching();
             if (_hookHandle != IntPtr.Zero)
             {
                 try { UnhookWindowsHookEx(_hookHandle); } catch { }
                 _hookHandle = IntPtr.Zero;
             }
-            if (!_dirty) return;
-            if (_currentFile != null)
-            {
-                SaveToFile();
-                if (_dirty) e.Cancel = true;
-                return;
-            }
-            MessageBoxResult r = MessageBox.Show(this, "文档尚未保存，要保存吗？", "写作",
-                MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
-            if (r == MessageBoxResult.Yes)
-            {
-                SaveToFile();
-                if (_dirty) e.Cancel = true;
-            }
-            else if (r == MessageBoxResult.Cancel)
-            {
-                e.Cancel = true;
-            }
+            // 所有标签:已命名的有改动就保存,当前未命名的有内容时询问
+            bool cancel;
+            SaveAllBeforeClose(out cancel);
+            if (cancel) e.Cancel = true;
         }
 
         // ---------- 全局键盘钩子(按键统计) ----------
@@ -2118,8 +3040,9 @@ namespace Writing
         void UpdateTitle()
         {
             string name = _currentFile == null ? "未命名" : Path.GetFileName(_currentFile);
-            Title = "写作 - " + name + (_dirty ? " ●" : "");
-            _fileNameText.Text = name + (_dirty ? " ●" : "");
+            string suffix = _dirty ? " ●" : "";
+            Title = "写作 - " + name + suffix;
+            _fileNameText.Text = (_tabs.Count > 1 ? "(" + (_tabs.IndexOf(_activeTab) + 1) + "/" + _tabs.Count + ") " : "") + name + suffix;
         }
 
         void UpdateStats()
@@ -2157,6 +3080,25 @@ namespace Writing
         void ShowError(string message)
         {
             MessageBox.Show(this, message, "写作", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    // 一个已打开的 txt 文档(标签页)。
+    // 同一时刻只有当前标签的内容在编辑框里,其余标签的内容保存在 Text 中;
+    // 切走时记录光标与滚动位置,切回来时原样恢复。
+    public class DocTab
+    {
+        public string Path = null;          // 落盘路径;null 表示尚未保存的"未命名"文档
+        public string Text = "";            // 文档内容
+        public string Encoding = "utf-8";   // 按打开时的原编码保存
+        public bool Dirty = false;          // 有未保存改动
+        public string Stamp = "";           // 上次读/写磁盘时的文件时间戳
+        public int CaretIndex = 0;          // 光标位置
+        public double ScrollOffset = 0;     // 垂直滚动位置
+
+        public string DisplayName
+        {
+            get { return Path == null ? "未命名" : System.IO.Path.GetFileName(Path); }
         }
     }
 

@@ -23,16 +23,18 @@ namespace Writing
                 e.Handled = true;
             };
             MainWindow win = new MainWindow();
-            // 支持命令行直接打开文件夹或 txt 文件
-            if (args != null && args.Length > 0)
+            // 支持命令行直接打开文件夹或 txt 文件(多个文件会各自打开一个标签页)
+            if (args != null)
             {
-                try
+                foreach (string arg in args)
                 {
-                    string p = args[0];
-                    if (Directory.Exists(p)) win.OpenFolder(p);
-                    else if (File.Exists(p)) win.LoadFile(p);
+                    try
+                    {
+                        if (Directory.Exists(arg)) win.OpenFolder(arg);
+                        else if (File.Exists(arg)) win.LoadFile(arg);
+                    }
+                    catch { }
                 }
-                catch { }
             }
             app.Run(win);
         }
