@@ -1,0 +1,2 @@
+# 混淆规则(默认关闭混淆,保留此文件供 hvigor 引用)
+-keep-property-name

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "写作 移动版"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "写作"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "写作"
+    }
+  ]
+}

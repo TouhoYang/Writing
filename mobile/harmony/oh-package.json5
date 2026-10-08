@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "mazi",
+  "version": "1.0.0",
+  "description": "写作 · 鸿蒙版",
+  "main": "",
+  "author": "touho",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

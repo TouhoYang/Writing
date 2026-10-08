@@ -1,0 +1,24 @@
+# 写作 Writing —— 版本库忽略规则
+
+# 构建工具链：不入库，需要时运行 mobile\获取安卓SDK.ps1 按需下载（解压后约 347 MB）
+mobile/android-sdk/
+mobile/build/
+
+# 打包中间产物 / 签名附加文件
+*.idsig
+*.apk.idsig
+*.keystore
+
+# 配置文件：程序把它存在 %APPDATA%\写作\Writing.ini（含 DPAPI 加密令牌），
+# 这里再兜一层，避免极端情况下回退写到 exe 同目录时被误提交
+Writing.ini
+LiveTyperSettings.ini
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
