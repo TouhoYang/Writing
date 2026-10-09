@@ -72,6 +72,8 @@ namespace Writing
         TreeViewItem _renameNode = null;
         bool _renameIsNew = false;
         string _renameDir = null;
+        // 就地改名期间:目录实时刷新/git 状态刷新都要让路,否则会把输入框刷掉导致编辑状态被迫退出
+        bool IsRenaming { get { return _renameBox != null; } }
         int _sessionAdded = 0;
         int _typedSinceLastTick = 0;
         long _lastTypeTick = 0;
@@ -1448,6 +1450,8 @@ namespace Writing
 
         void RefreshTree_Click(object sender, RoutedEventArgs e)
         {
+            // 正在就地改名:先不动这一层(否则会把输入框刷掉),改名结束后会自动补一次同步
+            if (IsRenaming) return;
             if (_treeRootPath != null && Directory.Exists(_treeRootPath))
             {
                 SyncTree();
@@ -1587,6 +1591,8 @@ namespace Writing
         void SyncTree()
         {
             if (_tree == null || _treeRootPath == null) return;
+            // 正在就地改名:整体推迟本次同步(改动都记在 _dirtyDirs 里,改名结束会补一次)
+            if (IsRenaming) return;
             if (!Directory.Exists(_treeRootPath))
             {
                 StopWatching();
@@ -1683,6 +1689,12 @@ namespace Writing
         // 原地更新某一层的子节点:内容变了才重建这一层,否则一个节点都不动
         void UpdateChildrenInPlace(TreeViewItem dirNode, string dir)
         {
+            // 正在改名的文件就在这一层:推迟到改名结束再重建,避免输入框被销毁
+            if (IsRenaming && !string.IsNullOrEmpty(_renameDir) &&
+                string.Equals(dir, _renameDir, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
             List<string> dirs = new List<string>();
             List<string> files = new List<string>();
             try
@@ -1952,6 +1964,8 @@ namespace Writing
         void UpdateNodeGitStatus(TreeViewItem node, int depth)
         {
             if (node == null || depth > 12 || node.Tag == null) return;
+            // 正在改名的节点:保持它的 Header(输入框)不动
+            if (IsRenaming && (ReferenceEquals(node, _renameNode) || ReferenceEquals(node.Header, _renameBox))) return;
             string tag = node.Tag as string;
             if (tag == null) return;
             if (tag.StartsWith("F|"))
@@ -2228,6 +2242,9 @@ namespace Writing
             if (box == null || node == null) return;
             _renameBox = null;      // 防重入(LostFocus 与 Enter 重复触发)
             _renameNode = null;
+            // 改名期间被推迟的目录同步与 git 状态刷新,在这里补做一次
+            ScheduleTreeSync();
+            ScheduleGitStatusRefresh();
 
             string name = box.Text.Trim();
             string oldTag = node.Tag as string;
