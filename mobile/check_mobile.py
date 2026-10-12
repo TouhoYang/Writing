@@ -162,6 +162,33 @@ def check_buttons(html):
         print('  [通过] %d 个按钮都有绑定' % len(btn_ids))
 
 
+def check_orphan_ids(html):
+    """D. getElementById('x') 引用的元素在 HTML 里是否存在。
+
+    删掉一个按钮时最容易忘掉它的绑定:getElementById 返回 null,
+    然后 null.onclick = ... 抛 TypeError,整个脚本从这里往后都不执行。
+    (真踩过:「稿件」按钮删掉后,btnDocs 的绑定还在。)
+    注意:注释里的 id 字符串不算问题,所以先把注释去掉再扫。
+    """
+    html_ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', html))
+
+    # 去掉注释后再找 JS 引用,避免注释里的示例代码被误报
+    no_comment = re.sub(r'/\*.*?\*/', '', html, flags=re.S)
+    no_comment = re.sub(r'//[^\n]*', '', no_comment)
+    js_ids = set(re.findall(r'getElementById\(\s*[\'"]([A-Za-z0-9_]+)[\'"]\s*\)', no_comment))
+
+    orphan = sorted(js_ids - html_ids)
+    if orphan:
+        for o in orphan:
+            lines = [no_comment[:m.start()].count('\n') + 1
+                     for m in re.finditer(r'getElementById\(\s*[\'"]' + re.escape(o) + r'[\'"]', no_comment)]
+            failures.append(
+                'getElementById("%s") 引用的元素不存在(会抛 TypeError)  第 %s 行' % (o, lines))
+        print('  [失败] %d 个悬空元素引用' % len(orphan))
+    else:
+        print('  [通过] 没有悬空的 getElementById 引用')
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
     if not os.path.isfile(path):
@@ -183,6 +210,8 @@ def main():
     check_undefined(blocks[-1])
     print('\nC. 按钮绑定')
     check_buttons(html)
+    print('\nD. 悬空元素引用')
+    check_orphan_ids(html)
 
     print()
     if failures:

@@ -208,7 +208,6 @@
 
 <header>
   <div class="row">
-    <button id="btnDocs">稿件</button>
     <button id="btnStats">输入统计</button>
     <button id="btnFolder">文件夹</button>
     <button id="btnGit">Git</button>
@@ -772,7 +771,10 @@ function closeSheets(){
   if (window.MaziHarmony && window.MaziHarmony.setSheetOpen) window.MaziHarmony.setSheetOpen(false);
 }
 mask.onclick = closeSheets;
-document.getElementById("btnDocs").onclick = function(){ renderDocList(); openSheet("docsSheet"); };
+/* 注意:「稿件」入口已按用户要求移除,原本这里是
+     稿件按钮.onclick = function(){ renderDocList(); openSheet("docsSheet"); };
+   抽屉的 DOM 与 renderDocList 保留,但已没有任何入口能打开它。
+   需要恢复时:在 header 第一个 row 里加回按钮,并恢复那一行绑定。 */
 document.getElementById("btnStats").onclick = function(){ renderCharList(); openSheet("statsSheet"); };
 document.getElementById("btnStatsReset").onclick = function(){
   charCounts = {}; saveJSON("mazi_chars_v1", charCounts); renderCharList();
@@ -1539,20 +1541,8 @@ function handlePickFolderResult(res, onFail){
   return false;
 }
 
-/* 「选择文件夹」伪按钮已从文件夹面板移除(工作目录固定为应用目录)。
-   这里保留一个不存在的元素引用会报错,所以整个绑定包在存在性判断里。 */
-(function(){
-  var b = document.getElementById('btnPickFolder');
-  if (!b) return;
-  b.onclick = function(){
-    if (!hasFs()) return;
-    callNativeAsync('pickFolder', []).then(function(res){
-      handlePickFolderResult(res, function(msg){
-        if (msg !== '已取消') elSaved.textContent = msg;
-      });
-    });
-  };
-})();
+/* 「选择文件夹」伪按钮已从文件夹面板移除(工作目录固定为应用目录),
+   对应的绑定也一并删除 —— 留着会一直引用一个不存在的元素。 */
 
 /* 刷新:重新拉取**已展开**的所有目录,而不是清空缓存只拉根目录。
    原来 treeCache={} 后只 loadDir(''),子目录没缓存就不渲染,
