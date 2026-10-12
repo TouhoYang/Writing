@@ -7,6 +7,7 @@
 mobile/
 ├─ index.html                    ← 共享本体(H5,含内联的 isomorphic-git / fflate / Buffer polyfill)
 ├─ README.md                     ← 本文档
+├─ check_mobile.py               ← 构建前静态检查(语法/漏定义/按钮绑定),务必先跑
 ├─ android/                      ← 安卓外壳(Java + WebView)
 │  ├─ AndroidManifest.xml
 │  ├─ src/com/touho/writing/
@@ -405,6 +406,44 @@ hdc shell "cat /data/app/el2/100/base/com.touho.writing/haps/entry/files/mazi-gi
 > 这是排查效率的关键。
 
 ---
+
+## ⚠️ 改完代码务必先跑检查脚本
+
+```powershell
+python mobile\check_mobile.py
+```
+
+**这个脚本是必需的，不是可选的。** 原因：
+
+「回滚功能」要成段删除代码，而**删除很容易连带切掉别的函数定义或事件绑定**。
+本项目已经因此踩了 3 次，每次的症状都是「**点了没反应**」这种最难查的问题：
+
+| # | 被误删的东西 | 症状 |
+|---|---|---|
+| 1 | `createTreeFile()` 的定义 | 「新建 txt」抛 `ReferenceError` |
+| 2 | `btnNewFile` 的 `onclick` 绑定 | 按钮**彻底静默**（连异常都没有） |
+| 3 | `notTextFile()` 的定义 | 点击文件抛 `ReferenceError`，**编辑区不加载** |
+
+**致命之处：hvigor 构建时一律不报错** —— 打包照常成功，只有运行时点到那条路径才炸。
+所以只能靠静态检查提前发现。
+
+脚本检查三项：
+
+| 项 | 内容 |
+|---|---|
+| **A. 语法** | 用 `node --check` 验证每个 `<script>` 块 |
+| **B. 漏定义** | 被调用的名字是否有定义（排除内建/库/参数） |
+| **C. 少绑定** | 每个 `<button id=...>` 是否有 `onclick` / `addEventListener` |
+
+退出码 0 = 通过。**建议把它当作构建流程的第一步**：
+
+```powershell
+cd mobile
+python check_mobile.py          # 必须全绿
+Copy-Item index.html harmony\entry\src\main\resources\rawfile\index.html -Force
+cd harmony
+hvigorw assembleHap --mode module -p product=default -p buildMode=release --no-daemon
+```
 
 ## 修改网页后要做什么
 
