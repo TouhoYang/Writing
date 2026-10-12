@@ -168,11 +168,13 @@ novelApp\
 ├─ mobile\              ← 移动版(安卓 / 鸿蒙,与电脑版共用一份 H5 本体)
 │  ├─ index.html           共享本体(含内联的 isomorphic-git / fflate / Buffer polyfill)
 │  ├─ README.md            移动版详细文档(构建、原生桥、踩坑记录)
+│  ├─ check_mobile.py      构建前静态检查(语法/漏定义/按钮绑定)
+│  ├─ build-hap.ps1        鸿蒙一键打包(版本号 + rel/trial 渠道)
+│  ├─ version_tool.py      版本号解析与 app.json5 写入
 │  ├─ android\             安卓外壳(Java + WebView + SAF)
 │  ├─ harmony\             鸿蒙外壳(ArkTS + ArkWeb)
 │  └─ build-apk.ps1        ← 一键打 APK
 ├─ build.ps1            ← 一键重新构建(Windows)
-└─ mobile\README.md     ← 移动版文档
 ```
 
 ## 重新构建（Windows）
@@ -191,7 +193,12 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 # 安卓
 cd mobile; powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
 
-# 鸿蒙(需要 DevEco Studio;注意先同步网页本体)
-Copy-Item mobile\index.html mobile\harmony\entry\src\main\resources\rawfile\index.html -Force
-cd mobile\harmony; hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
+# 鸿蒙(需要 DevEco Studio;一条命令搞定版本号、静态检查、构建、安装)
+cd mobile
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 0.1          # 正式包
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 0.1 trial    # 试用包
 ```
+
+鸿蒙打包脚本会自动：跑 `check_mobile.py` 静态检查 → 同步网页本体 →
+写入版本号 → 构建 release → 复制到 `mobile\harmony\dist\` → 安装到设备 →
+还原 `app.json5`。详见 [mobile/README.md](mobile/README.md#打包推荐一条命令)。

@@ -8,6 +8,8 @@ mobile/
 ├─ index.html                    ← 共享本体(H5,含内联的 isomorphic-git / fflate / Buffer polyfill)
 ├─ README.md                     ← 本文档
 ├─ check_mobile.py               ← 构建前静态检查(语法/漏定义/按钮绑定),务必先跑
+├─ build-hap.ps1                 ← 鸿蒙一键打包(自定义版本号 + rel/trial 渠道)
+├─ version_tool.py               ← 版本号解析/写入 app.json5(处理 UTF-8 与中文)
 ├─ android/                      ← 安卓外壳(Java + WebView)
 │  ├─ AndroidManifest.xml
 │  ├─ src/com/touho/writing/
@@ -316,7 +318,100 @@ powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
 
 ## 鸿蒙版
 
-### 构建步骤
+### 打包（推荐：一条命令）
+
+```powershell
+cd mobile
+
+# 版本号 0.1,正式包
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 0.1
+
+# 版本号 0.1,试用包
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 0.1 trial
+
+# 也可以用具名参数
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 -Version 1.2.3 -Channel rel
+
+# 只打包、不安装到手机
+powershell -ExecutionPolicy Bypass -File .\build-hap.ps1 0.1 -SkipInstall
+```
+
+**参数**
+
+| 参数 | 说明 |
+|---|---|
+| `版本号`（位置参数 0） | `0.1` 或 `1.2.3`；缺省段补 0。默认 `0.1` |
+| `渠道`（位置参数 1） | `rel`（默认） / `trial` |
+| `-Version` / `-Channel` | 同上，具名写法 |
+| `-SkipInstall` | 只打包，不安装 |
+| `-SkipCheck` | 跳过 `index.html` 静态检查（不建议） |
+| `-AllowDowngrade` | 设备上版本更高时先卸载再装（**会删数据**） |
+
+**渠道的含义**
+
+| 渠道 | versionName | 产物文件名 |
+|---|---|---|
+| `rel` | `0.1.0` | `写作-鸿蒙-0.1.0.hap` |
+| `trial` | `0.1.0-trial` | `写作-鸿蒙-0.1.0-trial.hap` |
+
+两个渠道**用同一个包名** `com.touho.writing`，所以手机上是**覆盖**关系，不能并存。
+
+**版本号换算**
+
+```
+versionCode = 主*10000 + 次*100 + 修订      (每段 0..99)
+
+"0.1"   -> versionName 0.1.0,  versionCode 100
+"1.2.3" -> versionName 1.2.3,  versionCode 10203
+```
+
+### 脚本做了什么（7 步）
+
+| 步 | 动作 |
+|---|---|
+| 1 | 校验版本号与渠道，算出 `versionName`/`versionCode`/产物名 |
+| 2 | 跑 `check_mobile.py` 静态检查（语法/漏定义/按钮绑定）—— **不通过就中止** |
+| 3 | 把 `index.html` 同步进 `harmony\entry\src\main\resources\rawfile\` |
+| 4 | 把版本写进 `AppScope\app.json5`（先备份） |
+| 5 | `hvigorw assembleHap -p buildMode=release` |
+| 6 | 把签名好的 HAP 复制到 `mobile\harmony\dist\`，打印大小与 SHA-256 |
+| 7 | 装到连接的设备（可选）并启动 |
+
+结束时**无论成功失败都会还原** `app.json5`（源码树保持干净，不留 `.bak`）。
+
+`mobile\version_tool.py` 是配套的版本处理脚本（解析/写入/还原）。
+单独用它也能算版本：
+
+```powershell
+python .\version_tool.py parse 0.1 trial
+```
+
+### 为什么需要 `version_tool.py`
+
+`app.json5` 里有中文（`app_name = 写作`），而 Windows PowerShell 5.1 按 ANSI 读取 `.ps1`，
+脚本里带中文会乱码。所以：
+
+- `build-hap.ps1` **保持纯 ASCII**（一行中文都没有）
+- 所有 UTF-8 / 中文处理都交给 `version_tool.py`（显式指定编码）
+- 产物文件名里的中文由 Python 生成，不经过 PowerShell 字符串
+
+### ⚠️ 安装时的版本降级
+
+系统**拒绝安装 versionCode 更低的包**：
+
+```
+error: failed to install bundle. code:9568263 error: install version downgrade
+```
+
+典型场景：设备上装着 `1.0.0`（code 10000），你去装 `0.1.0`（code 100）→ 被拒。
+
+三种处理：
+
+1. **装更高版本**（正常发版就该这样）
+2. **先导出数据再卸载**：文件夹面板「导出全部」+ Git 面板「导出仓库文件…」，然后手动卸载
+3. **加 `-AllowDowngrade`**：脚本自动卸载再装 —— ⚠️ **会删除应用私有目录（所有稿件和克隆的仓库）**
+
+### 手动构建（不用脚本）
 
 需要装有 DevEco Studio 的机器：
 
@@ -330,11 +425,15 @@ $env:PATH="$env:NODE_HOME;$env:JAVA_HOME\bin;D:\DevEco Studio\tools\ohpm\bin;D:\
 Copy-Item mobile\index.html mobile\harmony\entry\src\main\resources\rawfile\index.html -Force
 
 cd mobile\harmony
-hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
+hvigorw assembleHap --mode module -p product=default -p buildMode=release --no-daemon
 hdc install -r entry\build\default\outputs\default\entry-default-signed.hap
 ```
 
 签名材料由 DevEco 的「自动签名」生成（`File → Project Structure → Signing Configs`）。
+
+> ⚠️ **签名限制**：自动签名用的是 **debug 证书**，只能在**你自己华为开发者账号下登记的设备**上安装
+> （个人开发者上限 100 台）。给别人装或上架需要发布证书 + 发布 Profile。
+> 获取设备 UDID：`hdc shell bm get -u`
 
 ### 构建踩过的坑
 
