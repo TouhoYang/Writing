@@ -5,7 +5,12 @@ import { promptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import preferences from '@ohos.data.preferences';
 import http from '@ohos.net.http';
+import hilog from '@ohos.hilog';
 import { BusinessError } from '@kit.BasicServicesKit';
+
+/** 日志域/标签:用 hdc shell hilog -T MaziGit 就能只抓这一路 */
+const LOG_DOMAIN: number = 0x0A21;
+const LOG_TAG: string = 'MaziGit';
 
 /** 目录树里的一个条目 */
 interface MaziEntry {
@@ -129,6 +134,15 @@ class MaziBridge {
     return 'harmony';
   }
 
+  /** 写日志到 hilog,便于用 `hdc shell hilog -T MaziGit` 直接看 */
+  log(msg: string): void {
+    try {
+      hilog.info(LOG_DOMAIN, LOG_TAG, '%{public}s', msg === undefined || msg === null ? '' : msg);
+    } catch (e) {
+      // 日志失败不影响功能
+    }
+  }
+
   /** 记录一次原生文件操作失败(供网页诊断) */
   private noteErr(op: string, path: string, e: Object): void {
     let msg: string = '';
@@ -140,6 +154,7 @@ class MaziBridge {
     }
     this.fsOps++;
     this.lastErr = op + ' 失败 @ ' + path + '  (' + msg + ')';
+    this.log('[FS-FAIL] ' + this.lastErr);
   }
 
   /** 诊断:最近一次失败 + 调用次数 */
@@ -147,6 +162,101 @@ class MaziBridge {
     const s: string = this.lastErr;
     this.lastErr = '';
     return 'root=' + this.rootUri + ' ops=' + this.fsOps + '  ' + (s.length > 0 ? s : '(无失败)');
+  }
+
+  /**
+   * 用同一个 POST 请求体,依次尝试几种「把字节体交给 @ohos.net.http」的方式,
+   * 每种都把状态码或错误码写进日志 —— 一次就能看出哪种可行,不用来回试。
+   */
+  testHttpPost(url: string, bodyB64: string): void {
+    const bridge = this;
+    if (url === undefined || url === null || url.length === 0) {
+      this.log('[POST-TEST] 需要仓库地址');
+      return;
+    }
+    const body: Uint8Array = this.b64.decodeSync(bodyB64);
+    const ab: ArrayBuffer = new ArrayBuffer(body.length);
+    const view: Uint8Array = new Uint8Array(ab);
+    for (let i = 0; i < body.length; i++) {
+      view[i] = body[i];
+    }
+    const cnt: number = 3;
+    for (let v = 0; v < cnt; v++) {
+      const h: Record<string, string> = {
+        'content-type': 'application/x-git-upload-pack-request',
+        'accept': 'application/x-git-upload-pack-result'
+      };
+      if (v === 1) {
+        h['content-length'] = String(body.length);
+      }
+      let payload: string | ArrayBuffer = ab;
+      let label: string = 'ArrayBuffer';
+      if (v === 0) {
+        payload = ab;
+        label = 'ArrayBuffer 无 content-length';
+      } else if (v === 1) {
+        payload = ab;
+        label = 'ArrayBuffer + 手动 content-length';
+      } else {
+        let s: string = '';
+        for (let i = 0; i < body.length; i++) {
+          s += String.fromCharCode(body[i]);
+        }
+        payload = s;
+        label = '字符串(每字节一个字符)';
+      }
+      const opts: http.HttpRequestOptions = {
+        method: http.RequestMethod.POST,
+        header: h,
+        extraData: payload,
+        connectTimeout: 20000,
+        readTimeout: 30000,
+        maxLimit: 10 * 1024 * 1024,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER
+      };
+      const req = http.createHttp();
+      req.request(url, opts, (err: BusinessError, resp: http.HttpResponse) => {
+        try {
+          if (err !== undefined && err !== null && err.code !== 0) {
+            bridge.log('[POST-TEST] v' + v + ' ' + label + ' -> 错误 code=' + err.code + ' ' + err.message);
+          } else {
+            const n: number = (resp.result instanceof ArrayBuffer)
+              ? (resp.result as ArrayBuffer).byteLength : -1;
+            bridge.log('[POST-TEST] v' + v + ' ' + label + ' -> HTTP ' + resp.responseCode + ' len=' + n);
+          }
+        } catch (e) {
+          bridge.log('[POST-TEST] v' + v + ' 回调异常');
+        } finally {
+          req.destroy();
+        }
+      });
+    }
+  }
+
+  /**
+   * 把工作根目录设为应用私有目录 (context.filesDir)。
+   * 完全不依赖文件选择器与用户授权,用来验证 git 本身在这台设备上能否跑通 ——
+   * 私有目录下 fileIo 的 listFile / mkdir / open 都是完整可用的。
+   */
+  useAppDir(): void {
+    try {
+      const dir: string = this.context.filesDir;
+      this.rootUri = dir;
+      this.rootName = '应用目录';
+      let probe: string = 'filesDir=' + dir;
+      try {
+        const names: string[] = fs.listFileSync(dir);
+        probe += ' | listFile OK 条目数=' + names.length;
+      } catch (e) {
+        const be = e as BusinessError;
+        probe += ' | listFile 失败 code=' + be.code;
+      }
+      this.lastErr = 'useAppDir 取证: ' + probe;
+      this.okData('useAppDir', JSON.stringify({ uri: dir, name: this.rootName, probe: probe }));
+    } catch (e) {
+      const be2 = e as BusinessError;
+      this.fail('useAppDir', '取应用目录失败 code=' + be2.code);
+    }
   }
 
   /**
@@ -868,14 +978,46 @@ class MaziBridge {
       maxLimit: 100 * 1024 * 1024,
       expectDataType: http.HttpDataType.ARRAY_BUFFER
     };
+    let bodyBytesArr: Uint8Array | null = null;
     if (req.body !== undefined && req.body !== null && req.body.length > 0) {
-      options.extraData = this.b64.decodeSync(req.body);
+      bodyBytesArr = this.b64.decodeSync(req.body);
+      /* 传字节体的正确方式:用 ArrayBuffer。
+         不要用 Uint8Array(它是对象,可能不被当成原始字节),
+         也不要手动加 content-length —— 实测「手动 content-length + extraData」
+         会让 @ohos.net.http 直接报 2300999 Internal error,请求根本发不出去。
+         extraData 为 ArrayBuffer 时,库会自己算长度。 */
+      const ab: ArrayBuffer = new ArrayBuffer(bodyBytesArr.length);
+      const view: Uint8Array = new Uint8Array(ab);
+      for (let i = 0; i < bodyBytesArr.length; i++) {
+        view[i] = bodyBytesArr[i];
+      }
+      options.extraData = ab;
     }
 
     const bridge = this;
+    // 记录请求的全部细节 —— 400 这种错误必须看到「实际发出去的 header / body 长度」
+    // 以及「响应体里的说明」才能定位。
+    let hdrs: string = '';
+    try {
+      hdrs = JSON.stringify(reqHeaders);
+    } catch (e) {
+      hdrs = '(序列化失败)';
+    }
+    let bodyBytes: number = 0;
+    if (req.body !== undefined && req.body !== null && req.body.length > 0) {
+      try {
+        bodyBytes = this.b64.decodeSync(req.body).length;
+      } catch (e) {
+        bodyBytes = -1;
+      }
+    }
+    bridge.log('[HTTP→] ' + method + ' ' + req.url + '\n  headers=' + hdrs
+      + '\n  bodyBase64Len=' + ((req.body !== undefined && req.body !== null) ? req.body.length : 0)
+      + ' decodedBytes=' + bodyBytes);
     httpRequest.request(req.url, options, (err: BusinessError, resp: http.HttpResponse) => {
       try {
         if (err !== undefined && err !== null && err.code !== 0) {
+          bridge.log('[HTTP✗] ' + req.url + ' err.code=' + err.code + ' msg=' + err.message);
           bridge.okData('gitHttp', '');
           return;
         }
@@ -886,6 +1028,22 @@ class MaziBridge {
           bodyB64 = bridge.b64.encodeToStringSync(new Uint8Array(data));
         } else if (typeof data === 'string') {
           bodyB64 = bridge.b64.encodeToStringSync(new util.TextEncoder().encodeInto(data as string));
+        }
+        bridge.log('[HTTP←] ' + status + ' len=' + bodyB64.length + ' ' + req.url);
+        // 非 2xx 时把响应体前 400 字符也记下来 —— GitHub 的 400 会说明具体原因
+        if (status < 200 || status >= 300) {
+          let snippet: string = '';
+          try {
+            const dec = util.TextDecoder.create('utf-8');
+            const raw = bridge.b64.decodeSync(bodyB64);
+            snippet = dec.decodeToString(raw);
+          } catch (e) {
+            snippet = '(响应体解码失败)';
+          }
+          if (snippet.length > 400) {
+            snippet = snippet.substring(0, 400);
+          }
+          bridge.log('[HTTP-BODY ' + status + '] ' + snippet);
         }
         // resp.header 是 Object 类型;ArkTS 既不允许 src['k'] 也不允许 for...in,
         // 直接把整个对象 JSON 化交给网页过滤(已剔除 set-cookie 等敏感头)。
@@ -903,6 +1061,8 @@ class MaziBridge {
           + headersJson + ',"body":' + JSON.stringify(bodyB64) + '}';
         bridge.okData('gitHttp', outJson);
       } catch (e) {
+        const be = e as BusinessError;
+        bridge.log('[HTTP✗] 解析响应异常 code=' + be.code + ' msg=' + be.message);
         bridge.okData('gitHttp', '');
       } finally {
         httpRequest.destroy();
@@ -1095,7 +1255,7 @@ struct Index {
             'createFile', 'mkdir', 'remove', 'rename',
             'gitRead', 'gitWrite', 'gitMkdir', 'gitUnlink', 'gitRmdir',
             'gitReaddir', 'gitStat', 'gitExists', 'gitHttp', 'lastNativeErr', 'probeUri',
-            'configLoad', 'configSet', 'configRemove',
+            'configLoad', 'configSet', 'configRemove', 'useAppDir', 'log', 'testHttpPost',
             'saveText', 'importFile'
           ],
           controller: this.controller
