@@ -7,6 +7,7 @@ import preferences from '@ohos.data.preferences';
 import http from '@ohos.net.http';
 import hilog from '@ohos.hilog';
 import { BusinessError } from '@kit.BasicServicesKit';
+import bundleManager from '@ohos.bundle.bundleManager';
 
 /** 日志域/标签:用 hdc shell hilog -T MaziGit 就能只抓这一路 */
 const LOG_DOMAIN: number = 0x0A21;
@@ -88,6 +89,13 @@ interface MaziHttpRes {
   statusText: string;
   headers: Record<string, string>;
   body: string;         // base64
+}
+
+/** appVersion 的出参(ArkTS 不允许匿名对象字面量,必须先声明 interface) */
+interface MaziAppInfo {
+  label: string;
+  versionName: string;
+  versionCode: number;
 }
 
 /** 响应头暂存(ArkTS 不允许对 Record 做下标写入) */
@@ -354,6 +362,40 @@ class MaziBridge {
         }
       });
     }
+  }
+
+  /**
+   * 应用名与版本号,给网页的「关于」页用。
+   * 返回 JSON 字符串: {"label":"写作","versionName":"0.1.0","versionCode":100}
+   *
+   * 版本号从系统读取真实值(不是网页里写死的),这样「关于」页显示的
+   * 永远和实际安装的包一致 —— 出包时改 app.json5 就够了。
+   */
+  appVersion(): string {
+    let label: string = '写作';
+    let versionName: string = '';
+    let versionCode: number = 0;
+    try {
+      const info = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION);
+      if (info !== undefined && info !== null) {
+        versionName = info.versionName;
+        versionCode = info.versionCode;
+        if (info.appInfo !== undefined && info.appInfo.label.length > 0) {
+          label = info.appInfo.label;
+        }
+      }
+    } catch (e) {
+      const be = e as BusinessError;
+      this.log('[ABOUT] 读版本失败 code=' + be.code + ' msg=' + be.message);
+    }
+    const out: string = JSON.stringify({
+      label: label,
+      versionName: versionName,
+      versionCode: versionCode
+    } as MaziAppInfo);
+    this.log('[ABOUT] ' + out);
+    return out;
   }
 
   /**
@@ -1565,7 +1607,7 @@ struct Index {
             'createFile', 'mkdir', 'remove', 'rename',
             'gitRead', 'gitWrite', 'gitMkdir', 'gitUnlink', 'gitRmdir',
             'gitReaddir', 'gitStat', 'gitExists', 'gitHttp', 'lastNativeErr', 'probeUri',
-            'configLoad', 'configSet', 'configRemove', 'useAppDir', 'log', 'clearLog', 'testHttpPost',
+            'configLoad', 'configSet', 'configRemove', 'useAppDir', 'appVersion', 'log', 'clearLog', 'testHttpPost',
             'gitReadB64', 'saveB64', 'deleteTree',
             'saveText', 'importFile'
           ],

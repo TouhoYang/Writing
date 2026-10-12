@@ -80,6 +80,48 @@
   }
   footer b{font-size:15px; color:var(--fg); font-weight:600;}
   footer b.speed{color:var(--accent);}
+  /* ---------- 全屏页面:设置 / Git设置 / 关于 ---------- */
+  .page{
+    position:fixed; left:0; right:0; top:0; bottom:0; z-index:40;
+    background:var(--page); display:flex; flex-direction:column;
+  }
+  .page[hidden]{display:none;}
+  .phead{
+    flex:none; display:flex; align-items:center; gap:10px;
+    padding:12px 12px 12px 4px; background:#fff; border-bottom:1px solid var(--line);
+    /* 顶部与状态栏留出安全距离 */
+    padding-top:calc(12px + env(safe-area-inset-top, 0px));
+  }
+  .pback{
+    flex:none; font:inherit; font-size:14px; color:var(--accent, #2F6FEB);
+    background:transparent; border:none; padding:6px 10px; white-space:nowrap;
+  }
+  .ptitle{font-size:15px; font-weight:600; color:var(--fg); flex:1; text-align:center;
+    padding-left:60px;    /* 与右侧动作按钮对称,让标题真正居中 */ }
+  .pact{
+    flex:none; font:inherit; font-size:13px; color:var(--fg-soft);
+    background:transparent; border:none; padding:6px 10px; white-space:nowrap;
+  }
+  /* Git 页里的分节标题(原来是 h4) */
+  .psec{font-size:12px; color:var(--fg-faint); padding:6px 4px 6px; margin-top:6px;}
+  .pbody{flex:1; overflow:auto; padding:12px 12px 32px; -webkit-overflow-scrolling:touch;}
+
+  /* 设置页里的条目(整行可点) */
+  .pitem{
+    display:flex; align-items:center; gap:8px; background:#fff; border-radius:10px;
+    padding:16px 14px; margin-bottom:10px; border:1px solid var(--line);
+    font-size:15px; color:var(--fg);
+  }
+  .pitem:active{background:var(--hover);}
+  .pitem .plabel{flex:1;}
+  .pitem .pchev{color:var(--fg-faint); font-size:18px; line-height:1;}
+
+  /* 关于页 */
+  .about{display:flex; flex-direction:column; align-items:center; gap:10px; padding:48px 16px;}
+  .about .aname{font-size:26px; font-weight:700; color:var(--fg); letter-spacing:2px;}
+  .about .aver{font-size:14px; color:var(--fg-soft);}
+  .about .acopy{font-size:12px; color:var(--fg-faint); margin-top:12px;}
+
   /* ---------- 抽屉:稿件 / 统计 ---------- */
   .sheet{
     position:fixed; left:0; right:0; bottom:0; top:auto; max-height:72vh;
@@ -213,6 +255,7 @@
     <button id="btnGit">Git</button>
     <button id="btnImport">导入 txt</button>
     <button id="btnExport">导出 txt</button>
+    <button id="btnSettings">设置</button>
     <button id="btnSave" class="primary">保存</button>
   </div>
   <div class="row">
@@ -222,8 +265,6 @@
     <button id="btnFontMinus">A-</button>
     <span class="size" id="fontSize">19</span>
     <button id="btnFontPlus">A+</button>
-    <span class="sep"></span>
-    <button id="btnTop">全屏</button>
     <span class="sep"></span>
     <span class="label">背景</span>
     <button class="sw on" data-bg="#FFFFFF"><i style="background:#FFFFFF"></i></button>
@@ -252,6 +293,131 @@
 </footer>
 
 <div class="mask" id="mask"></div>
+
+<!-- ================= 全屏页面(设置 / Git设置 / 关于) =================
+     用 position:fixed 覆盖整个视口,打开时把 header/main/footer 藏起来,
+     所以看起来就是「进入了新页面」。 -->
+<div id="pageSettings" class="page" hidden>
+  <div class="phead">
+    <button class="pback" data-page-close>‹ 返回</button>
+    <span class="ptitle">设置</span>
+  </div>
+  <div class="pbody">
+    <div id="setGitHost"></div>
+        <div class="gsec">
+          <h4>仓库</h4>
+          <div class="grow">
+            <select class="gin" id="gitRepo"></select>
+          </div>
+          <div class="grow">
+            <button id="btnGitAddRepo">用当前文件夹作仓库</button>
+            <button id="btnGitInit">init 初始化</button>
+            <button id="btnGitOpenFolder">换文件夹</button>
+            <button id="btnGitDiag">诊断信息</button>
+          </div>
+          <div class="grow">
+            <button id="btnGitExport" class="primary">导出仓库文件…</button>
+          </div>
+          <div class="hint" id="gitRepoHint">仓库保存在应用私有目录（鸿蒙不允许应用在用户目录创建文件夹，所以仓库无法直接放在「我的手机」里；需要的话用上面的「导出仓库文件…」保存到你想放的位置）。</div>
+        </div>
+
+        <div class="gsec">
+          <h4>提交 / 推送</h4>
+          <div class="grow">
+            <input class="gin" id="gitMsg" placeholder="提交说明（可留空自动生成）">
+          </div>
+          <div class="grow">
+            <button id="btnGitCommit" class="primary">提交</button>
+            <button id="btnGitPush">提交并推送</button>
+            <button id="btnGitPull">拉取</button>
+          </div>
+        </div>
+    <div class="pitem" id="openAbout">
+      <span class="plabel">关于</span>
+      <span class="pchev">›</span>
+    </div>
+  </div>
+</div>
+
+<div id="pageGit" class="page" hidden>
+  <div class="phead">
+    <button class="pback" data-page-close>‹ 返回</button>
+    <span class="ptitle">Git 设置</span>
+    <button class="pact" id="btnGitRefresh">刷新</button>
+  </div>
+  <div class="pbody" id="gitPageHost">
+    <div class="psec">克隆仓库（填链接 → 选文件夹 → 拉取内容）</div>
+        <div class="gsec">
+          <div class="grow">
+            <input class="gin mono" id="gitCloneUrl" placeholder="https://github.com/用户名/仓库名.git">
+          </div>
+          <div class="grow">
+            <button id="btnGitClone" class="primary">一键克隆仓库</button>
+          </div>
+          <div class="hint" id="gitCloneHint">填链接后点「一键克隆仓库」，仓库会保存到应用内的工作目录。</div>
+        </div>
+
+    <div class="psec">状态</div>
+        <div class="gsec">
+          <div class="glist" id="gitStatus"></div>
+          <div class="hint" id="gitState">—</div>
+        </div>
+
+    <div class="psec">分支</div>
+        <div class="gsec">
+          <div class="grow">
+            <select class="gin" id="gitBranch"></select>
+            <button id="btnGitCheckout">切换</button>
+          </div>
+        </div>
+
+    <div class="psec">令牌（Personal access token）</div>
+        <div class="gsec">
+          <div class="glist" id="gitTokenList"></div>
+          <div class="grow" style="margin-top:8px">
+            <select class="gin" id="gitTokenSel" style="display:none"></select>
+          </div>
+          <div class="grow">
+            <input class="gin" id="gitHost" placeholder="主机名，如 github.com">
+          </div>
+          <div class="grow">
+            <input class="gin" id="gitUser" placeholder="用户名">
+          </div>
+          <div class="grow">
+            <input class="gin mono" id="gitToken" type="password" placeholder="令牌（仅存本机）">
+          </div>
+          <div class="grow">
+            <button id="btnGitTokenSave" class="primary">确认（添加/更新令牌）</button>
+            <button id="btnGitTokenDel">删除令牌</button>
+          </div>
+          <div class="hint" id="gitTokenHint"></div>
+        </div>
+
+    <div class="psec">提交历史</div>
+        <div class="gsec">
+          <div id="gitLog"></div>
+        </div>
+
+    <div class="psec">输出</div>
+        <div class="gsec">
+          <div class="glog" id="gitOut">—</div>
+        </div>
+  </div>
+</div>
+
+<div id="pageAbout" class="page" hidden>
+  <div class="phead">
+    <button class="pback" data-page-close>‹ 返回</button>
+    <span class="ptitle">关于</span>
+  </div>
+  <div class="pbody">
+    <div class="about">
+      <div class="aname" id="aboutName">写作</div>
+      <div class="aver" id="aboutVersion">版本 —</div>
+      <div class="acopy">写作 Writing · 鸿蒙版</div>
+    </div>
+  </div>
+</div>
 
 <!-- 应用内弹窗(替代 prompt / confirm) -->
 <div id="uiModal">
@@ -293,99 +459,6 @@
 
 
 <!-- Git 面板 -->
-<div class="sheet" id="gitSheet">
-  <h3>写作 · Git<button id="btnGitRefresh">刷新</button></h3>
-  <div class="body">
-
-    <div class="gsec">
-      <h4>克隆仓库（填链接 → 选文件夹 → 拉取内容）</h4>
-      <div class="grow">
-        <input class="gin mono" id="gitCloneUrl" placeholder="https://github.com/用户名/仓库名.git">
-      </div>
-      <div class="grow">
-        <button id="btnGitClone" class="primary">一键克隆仓库</button>
-      </div>
-      <div class="hint" id="gitCloneHint">填链接后点「一键克隆仓库」，仓库会保存到应用内的工作目录。</div>
-    </div>
-
-    <div class="gsec">
-      <h4>仓库</h4>
-      <div class="grow">
-        <select class="gin" id="gitRepo"></select>
-      </div>
-      <div class="grow">
-        <button id="btnGitAddRepo">用当前文件夹作仓库</button>
-        <button id="btnGitInit">init 初始化</button>
-        <button id="btnGitOpenFolder">换文件夹</button>
-        <button id="btnGitDiag">诊断信息</button>
-      </div>
-      <div class="grow">
-        <button id="btnGitExport" class="primary">导出仓库文件…</button>
-      </div>
-      <div class="hint" id="gitRepoHint">仓库保存在应用私有目录（鸿蒙不允许应用在用户目录创建文件夹，所以仓库无法直接放在「我的手机」里；需要的话用上面的「导出仓库文件…」保存到你想放的位置）。</div>
-    </div>
-
-    <div class="gsec">
-      <h4>状态</h4>
-      <div class="glist" id="gitStatus"></div>
-      <div class="hint" id="gitState">—</div>
-    </div>
-
-    <div class="gsec">
-      <h4>分支</h4>
-      <div class="grow">
-        <select class="gin" id="gitBranch"></select>
-        <button id="btnGitCheckout">切换</button>
-      </div>
-    </div>
-
-    <div class="gsec">
-      <h4>提交 / 推送</h4>
-      <div class="grow">
-        <input class="gin" id="gitMsg" placeholder="提交说明（可留空自动生成）">
-      </div>
-      <div class="grow">
-        <button id="btnGitCommit" class="primary">提交</button>
-        <button id="btnGitPush">提交并推送</button>
-        <button id="btnGitPull">拉取</button>
-      </div>
-    </div>
-
-    <div class="gsec">
-      <h4>令牌（Personal access token）</h4>
-      <div class="glist" id="gitTokenList"></div>
-      <div class="grow" style="margin-top:8px">
-        <select class="gin" id="gitTokenSel" style="display:none"></select>
-      </div>
-      <div class="grow">
-        <input class="gin" id="gitHost" placeholder="主机名，如 github.com">
-      </div>
-      <div class="grow">
-        <input class="gin" id="gitUser" placeholder="用户名">
-      </div>
-      <div class="grow">
-        <input class="gin mono" id="gitToken" type="password" placeholder="令牌（仅存本机）">
-      </div>
-      <div class="grow">
-        <button id="btnGitTokenSave" class="primary">确认（添加/更新令牌）</button>
-        <button id="btnGitTokenDel">删除令牌</button>
-      </div>
-      <div class="hint" id="gitTokenHint"></div>
-    </div>
-
-    <div class="gsec">
-      <h4>提交历史</h4>
-      <div id="gitLog"></div>
-    </div>
-
-    <div class="gsec">
-      <h4>输出</h4>
-      <div class="glog" id="gitOut">—</div>
-    </div>
-
-  </div>
-</div>
-
 <!-- 输入统计抽屉 -->
 <div class="sheet" id="statsSheet">
   <h3>输入统计<button id="btnStatsReset">重置</button></h3>
@@ -684,22 +757,8 @@ for (var i = 0; i < sws.length; i++){
   sws[i].onclick = function(){ settings.bg = this.getAttribute("data-bg"); applySettings(); };
 }
 /* 沉浸式全屏(手机浏览器可用时) */
-var btnTop = document.getElementById("btnTop");
-function syncFullscreen(){
-  var fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-  btnTop.textContent = fs ? "退出全屏" : "全屏";
-  btnTop.classList.toggle("on", fs);
-}
-btnTop.onclick = function(){
-  var el = document.documentElement, fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-  if (fs){ (document.exitFullscreen || document.webkitExitFullscreen).call(document); }
-  else if (el.requestFullscreen) el.requestFullscreen();
-  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-  setTimeout(syncFullscreen, 300);
-};
-document.addEventListener("fullscreenchange", syncFullscreen);
-document.addEventListener("webkitfullscreenchange", syncFullscreen);
-syncFullscreen();
+/* 「全屏」按钮已按需求移除。ArkWeb 里 requestFullscreen 本来也不可靠,
+   这块逻辑(含 fullscreenchange 监听)一并去掉,避免引用不存在的元素。 */
 
 /* ================= 导入 / 导出 ================= */
 document.getElementById("btnImport").onclick = function(){
@@ -765,7 +824,6 @@ function openSheet(id){
 function closeSheets(){
   document.getElementById("docsSheet").classList.remove("open");
   document.getElementById("treeSheet").classList.remove("open");
-  document.getElementById("gitSheet").classList.remove("open");
   document.getElementById("statsSheet").classList.remove("open");
   mask.classList.remove("on");
   if (window.MaziHarmony && window.MaziHarmony.setSheetOpen) window.MaziHarmony.setSheetOpen(false);
@@ -2530,11 +2588,91 @@ function gitRun(label, fn){
   });
 }
 
+/* ================= 全屏页面:设置 / Git设置 / 关于 =================
+ * 用一套极简的「页面栈」:
+ *   - 打开页面时把 header/main/footer 藏起来(记住原 display),页面容器铺满视口
+ *   - 返回时全部还原
+ *   - 返回键(window.maziBack)优先关页面,再考虑抽屉
+ * 这样既有"进入新页面"的观感,又不用引入任何路由。
+ */
+var curPage = null;
+var pageSavedDisplay = null;      // 打开页面时被隐藏元素的原始 display
+
+function openPage(id){
+  var el = document.getElementById(id);
+  if (!el) return;
+
+  /* 离开 Git 页时不必做特殊处理;进入时刷新数据 */
+  if (id === 'pageGit' && typeof gitRefreshAll === 'function') gitRefreshAll();
+
+  if (curPage && curPage !== id){
+    document.getElementById(curPage).hidden = true;
+  } else if (!curPage){
+    /* 第一次打开:隐藏主界面 */
+    pageSavedDisplay = [];
+    ['header', 'main', 'footer'].forEach(function(tag){
+      var nodes = document.getElementsByTagName(tag);
+      for (var i = 0; i < nodes.length; i++){
+        pageSavedDisplay.push([nodes[i], nodes[i].style.display]);
+        nodes[i].style.display = 'none';
+      }
+    });
+  }
+  el.hidden = false;
+  curPage = id;
+  if (id === 'pageAbout') fillAboutPage();
+}
+
+function closePage(){
+  if (!curPage) return false;
+  document.getElementById(curPage).hidden = true;
+  curPage = null;
+  if (pageSavedDisplay){
+    pageSavedDisplay.forEach(function(pair){ pair[0].style.display = pair[1]; });
+    pageSavedDisplay = null;
+  }
+  return true;
+}
+
+/** 关于页:应用名 + 版本号(取原生的真实版本,取不到就显示占位) */
+function fillAboutPage(){
+  var nameEl = document.getElementById('aboutName');
+  var verEl = document.getElementById('aboutVersion');
+  if (verEl) verEl.textContent = '版本 —';
+  if (!window.MaziHarmony || typeof window.MaziHarmony.appVersion !== 'function'){
+    if (verEl) verEl.textContent = '版本（浏览器预览）';
+    return;
+  }
+  callNative('appVersion', []).then(function(res){
+    if (res && res.ok && res.data){
+      var d = {};
+      try { d = JSON.parse(res.data); } catch (e) { d = {}; }
+      if (nameEl && d.label) nameEl.textContent = d.label;
+      if (verEl) verEl.textContent = '版本 ' + (d.versionName || '未知');
+      maziLog('[ABOUT] ' + (d.label || '') + ' ' + (d.versionName || ''));
+    } else {
+      if (verEl) verEl.textContent = '版本（读取失败）';
+    }
+  });
+}
+
+/* 所有「‹ 返回」按钮 + 设置页的两个入口 */
+(function(){
+  var backs = document.querySelectorAll('[data-page-close]');
+  for (var i = 0; i < backs.length; i++){
+    backs[i].onclick = function(){ closePage(); };
+  }
+  var bSet = document.getElementById('btnSettings');
+  if (bSet) bSet.onclick = function(){ openPage('pageSettings'); };
+  var bAbout = document.getElementById('openAbout');
+  if (bAbout) bAbout.onclick = function(){ openPage('pageAbout'); };
+})();
+
 /* ---------- UI 绑定 ---------- */
+/* 「Git」按钮:直接进 Git 设置页(与「设置 → Git 设置」同一个页面) */
 document.getElementById('btnGit').onclick = function(){
   if (!hasFs()){ uiAlert('Git 功能需要在鸿蒙 App 内使用。'); return; }
-  gitRefreshAll();
-  openSheet('gitSheet');
+  openPage('pageGit');
 };
 document.getElementById('btnGitRefresh').onclick = gitRefreshAll;
 document.getElementById('gitRepo').onchange = function(){
@@ -3128,11 +3266,12 @@ function doClone(url, dir){
 
 /* 远端地址一览(与桌面版一样显示在状态里) */
 
-/* ================= 安卓返回键:优先关闭抽屉 ================= */
+/* ================= 安卓返回键:页面 > 抽屉 ================= */
 window.maziBack = function(){
+  /* 先关全屏页面(设置 / Git设置 / 关于) */
+  if (curPage){ closePage(); return true; }
   if (document.getElementById("docsSheet").classList.contains("open") ||
       document.getElementById("treeSheet").classList.contains("open") ||
-      document.getElementById("gitSheet").classList.contains("open") ||
       document.getElementById("statsSheet").classList.contains("open")){
     closeSheets();
     return true;
