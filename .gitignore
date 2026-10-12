@@ -10,6 +10,8 @@ mobile/build/
 mobile/harmony/entry/build/
 mobile/harmony/.hvigor/
 mobile/harmony/.appanalyzer/
+# DevEco 预览器缓存(每次预览都会变,不该入库)
+mobile/harmony/entry/.preview/
 .hvigor/
 .appanalyzer/
 oh_modules/
@@ -22,6 +24,10 @@ mobile/android/build/
 *.idsig
 *.apk.idsig
 *.keystore
+
+# 分发包产物(体积大且可重建,不入库)
+mobile/harmony/dist/
+mobile/android/build/
 
 # 配置文件：程序把它存在 %APPDATA%\写作\Writing.ini（含 DPAPI 加密令牌），
 # 这里再兜一层，避免极端情况下回退写到 exe 同目录时被误提交
