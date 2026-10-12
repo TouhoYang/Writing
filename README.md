@@ -4,6 +4,19 @@
 
 **发布版**：`Release\写作.exe`（约 195 KB）
 
+同一套写作与 Git 体验也搬到了手机上：**安卓 APK / 鸿蒙 HAP**，与电脑版共用一份网页本体。
+详见 **[mobile/README.md](mobile/README.md)**。
+
+| 平台 | 产物 | 说明 |
+|---|---|---|
+| Windows | `Release\写作.exe` | 单文件绿色版，功能最全 |
+| 安卓 | `mobile\android\build\写作.apk` | WebView 外壳 + SAF 文件访问 + Git |
+| 鸿蒙 | `mobile\harmony\...\entry-default-signed.hap` | ArkWeb 外壳，Git 全套可用 |
+
+> 手机端的文件只能存在**应用私有目录**（系统按文件节点授权，不提供目录级写权限），
+> 所以卸载会丢文件；要放进「文件管理」需用「导出」功能。
+> 具体原因与实测证据见 [mobile/README.md](mobile/README.md#目录访问为什么只能用应用私有目录)。
+
 ## 功能清单（对应需求）
 
 | # | 需求 | 实现 |
@@ -85,6 +98,11 @@
 工具栏「Git」打开管理面板。需要本机已安装 [Git for Windows](https://git-scm.com)（程序会自动从 PATH 与常见安装目录查找 `git.exe`）。
 
 - **多仓库**：添加任意本地 git 仓库（自动校验 `.git`），仓库列表保存在配置里；「在目录树中打开」可把该仓库直接设为目录树根
+- **克隆仓库（填链接即可）**：在「克隆仓库」输入框里填仓库链接 → 点「选择文件夹并克隆」→ 选一个**空文件夹作为仓库根目录**
+  （它不是空的会明确拒绝，避免把已有文件搞乱）。克隆完成后自动加入仓库列表并切换过去；日志区实时显示 `git clone` 的原始输出
+  - 在**父目录**里执行 `git clone <url> <文件夹名>`，这样 git 能自己创建目标目录，兼容不同 git 版本对「目录已存在」的处理差异
+  - 支持 `https://` / `git@` / `ssh://`；`https` 私有仓库自动套用已保存的该主机 PAT（`http.extraheader: Authorization: Basic ...`），`ssh` 走系统密钥
+  - 克隆前按远端地址查重（`FindRepoByUrl`，比较时忽略大小写与结尾 `.git`），已克隆过就直接切过去并 `pull`，不会重复克隆
 - **状态一览**：当前分支、变更文件数、领先/落后提交、最近一次提交、远端地址
 - **更改列表**：实时列出工作区改动，带 VS Code 风格的状态字母与颜色（M / U / A / D）
 - **提交历史（更新列表）**：列出最近 40 条提交（提交说明、作者、日期），每次刷新或提交后自动更新
@@ -147,13 +165,33 @@ novelApp\
 │  ├─ Test.cs              逻辑自测(控制台,可选)
 │  ├─ app.manifest         高 DPI / 系统兼容清单
 │  └─ app.ico              图标
-└─ build.ps1               ← 一键重新构建脚本
+├─ mobile\              ← 移动版(安卓 / 鸿蒙,与电脑版共用一份 H5 本体)
+│  ├─ index.html           共享本体(含内联的 isomorphic-git / fflate / Buffer polyfill)
+│  ├─ README.md            移动版详细文档(构建、原生桥、踩坑记录)
+│  ├─ android\             安卓外壳(Java + WebView + SAF)
+│  ├─ harmony\             鸿蒙外壳(ArkTS + ArkWeb)
+│  └─ build-apk.ps1        ← 一键打 APK
+├─ build.ps1            ← 一键重新构建(Windows)
+└─ mobile\README.md     ← 移动版文档
 ```
 
-## 重新构建
+## 重新构建（Windows）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
 使用系统自带 `csc.exe` 编译，**无需安装 .NET SDK、无需联网下载任何依赖**。
+
+## 重新构建（移动端）
+
+见 [mobile/README.md](mobile/README.md)。简要说：
+
+```powershell
+# 安卓
+cd mobile; powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
+
+# 鸿蒙(需要 DevEco Studio;注意先同步网页本体)
+Copy-Item mobile\index.html mobile\harmony\entry\src\main\resources\rawfile\index.html -Force
+cd mobile\harmony; hvigorw assembleHap --mode module -p product=default -p buildMode=debug --no-daemon
+```

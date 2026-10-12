@@ -219,7 +219,16 @@ class AndroidFs {
 
     // ==================== git 文件系统接口 ====================
 
-    /** 读文件:文本返回 UTF-8;二进制返回 "b64:..." ;不存在返回 null */
+    /**
+     * 读文件:一律返回 "b64:<base64>" (二进制安全),由网页端按需解码。
+     *
+     * 之前靠「内容里有没有 0 字节」猜文本/二进制,但 zlib 压缩过的 git 对象
+     * 与 packfile 的 .idx 里几乎没有 0 字节,会被误判成文本而遭 UTF-8 破坏
+     * —— 表现为克隆/提交时报 "incorrect header check" 或
+     * "Cannot read properties of undefined (reading 'error')"。
+     * 一律走 base64 可保证字节完全一致。
+     * (鸿蒙侧同样处理)
+     */
     synchronized String gitRead(String rel) {
         if (rootUri() == null || rel == null) return null;
         String id = findId(rel);
@@ -231,17 +240,8 @@ class AndroidFs {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             byte[] buf = new byte[8192];
             int n;
-            boolean binary = false;
-            while ((n = in.read(buf)) > 0) {
-                for (int i = 0; i < n; i++) if (buf[i] == 0) { binary = true; break; }
-                bos.write(buf, 0, n);
-                if (binary) break;
-            }
-            if (binary) {
-                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
-                return "b64:" + Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP);
-            }
-            return new String(bos.toByteArray(), "UTF-8");
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            return "b64:" + Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP);
         } catch (Exception e) {
             return null;
         } finally {
@@ -261,7 +261,10 @@ class AndroidFs {
             if (parentId == null) return false;
 
             byte[] bytes;
-            if (data != null && data.length() > 4 && data.startsWith("b64:")) {
+            // 只按前缀判断,不能用长度当条件 —— 空文件的 base64 是空串,
+            // payload 恰好是 "b64:"(长度 4),"length() > 4" 会漏掉它,
+            // 结果把字面量 b64: 写进文件(首次推送时空文件里会多出 b64:)。
+            if (data != null && data.length() >= 4 && data.startsWith("b64:")) {
                 bytes = Base64.decode(data.substring(4), Base64.NO_WRAP);
             } else {
                 bytes = (data == null ? "" : data).getBytes("UTF-8");
@@ -381,15 +384,68 @@ class AndroidFs {
             String newRel = parentOf(oldRel).length() == 0 ? newName : (parentOf(oldRel) + "/" + newName);
             boolean wasDir = Boolean.TRUE.equals(isDir.get(oldRel));
             if (wasDir) {
-                // 目录:仅移动顶层不可行,这里只支持空目录改名
-                boolean del = gitUnlink(oldRel);
-                if (!del) return false;
-                return gitMkdir(newRel);
+                // 目录:SAF 无法整体移动,先建新目录再把内容逐个搬过去
+                if (!gitMkdir(newRel)) return false;
+                if (!moveContents(oldRel, newRel)) return false;
+                return gitRmdir(oldRel);
             }
             String data = gitRead(oldRel);
             if (data == null) return false;
             if (!gitWrite(newRel, data)) return false;
             return gitUnlink(oldRel);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 把一个目录下的内容递归搬到另一个目录(目录重命名用) */
+    private boolean moveContents(String fromRel, String toRel) {
+        String json = listDirJson(fromRel);
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name");
+                String childFrom = fromRel + "/" + name;
+                String childTo = toRel + "/" + name;
+                if (o.optBoolean("isDir")) {
+                    if (!gitMkdir(childTo)) return false;
+                    if (!moveContents(childFrom, childTo)) return false;
+                    if (!gitRmdir(childFrom)) return false;
+                } else {
+                    String data = gitRead(childFrom);
+                    if (data == null) return false;
+                    if (!gitWrite(childTo, data)) return false;
+                    if (!gitUnlink(childFrom)) return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 递归删除文件夹。
+     * rmdirSync / rwRmdir 只能删空目录,所以文件夹删除必须自己递归 ——
+     * 否则界面上「删除文件夹」永远失败,形同不可用。
+     */
+    synchronized boolean deleteTree(String rel) {
+        if (rootUri() == null || rel == null || rel.length() == 0) return false;
+        String json = listDirJson(rel);
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name");
+                String child = rel + "/" + name;
+                if (o.optBoolean("isDir")) {
+                    if (!deleteTree(child)) return false;   // 递归删子目录
+                } else {
+                    if (!gitUnlink(child)) return false;
+                }
+            }
+            return gitRmdir(rel);
         } catch (Exception e) {
             return false;
         }

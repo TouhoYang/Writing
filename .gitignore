@@ -16,6 +16,7 @@ oh_modules/
 
 # 安卓构建时会自动生成(由 mobile\index.html 拷贝而来),不入库免得来回改动
 mobile/android/assets/
+mobile/android/build/
 
 # 打包中间产物 / 签名附加文件
 *.idsig

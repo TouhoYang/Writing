@@ -426,6 +426,17 @@ public class MainActivity extends Activity {
             } }).start();
         }
 
+        /** 递归删除文件夹(rwRmdir 只能删空目录,所以文件夹删除要用这个) */
+        @JavascriptInterface
+        public void deleteTree(final String rel) {
+            if (fs.rootUri() == null) { emit("deleteTree", fail("还没有选定文件夹")); return; }
+            if (rel == null || rel.length() == 0) { emit("deleteTree", fail("不能删除根目录")); return; }
+            new Thread(new Runnable() { @Override public void run() {
+                if (fs.deleteTree(rel)) emit("deleteTree", ok("{\"path\":" + js(rel) + ",\"bytes\":0}"));
+                else emit("deleteTree", fail("删除失败：" + rel));
+            } }).start();
+        }
+
         @JavascriptInterface
         public void rename(final String oldRel, final String newName) {
             if (fs.rootUri() == null) { emit("rename", fail("还没有选定文件夹")); return; }

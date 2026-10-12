@@ -134,13 +134,135 @@ class MaziBridge {
     return 'harmony';
   }
 
-  /** 写日志到 hilog,便于用 `hdc shell hilog -T MaziGit` 直接看 */
+  /**
+   * 写日志。两路输出:
+   *   1) hilog(便于 hilog -T MaziGit)
+   *   2) 应用私有目录下的 mazi-git.log 文件 —— hilog 缓冲会被系统日志冲掉、
+   *      而且实测有时抓不到,写文件最可靠,可以直接 pull 出来看。
+   */
   log(msg: string): void {
+    const text: string = (msg === undefined || msg === null) ? '' : msg;
     try {
-      hilog.info(LOG_DOMAIN, LOG_TAG, '%{public}s', msg === undefined || msg === null ? '' : msg);
+      hilog.info(LOG_DOMAIN, LOG_TAG, '%{public}s', text);
     } catch (e) {
-      // 日志失败不影响功能
+      // 忽略
     }
+    try {
+      const p: string = this.context.filesDir + '/mazi-git.log';
+      const f = fs.openSync(p, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.APPEND);
+      let stamp: string = '';
+      try {
+        stamp = new Date().toISOString();
+      } catch (e2) {
+        stamp = '';
+      }
+      const line: string = '[' + stamp + '] ' + text + '\n';
+      fs.writeSync(f.fd, this.utf8BufferOf(line));
+      fs.closeSync(f);
+    } catch (e3) {
+      // 文件日志失败也不影响功能
+    }
+  }
+
+  /** 清空日志文件 */
+  clearLog(): void {
+    try {
+      const p: string = this.context.filesDir + '/mazi-git.log';
+      if (this.exists(p)) {
+        fs.unlinkSync(p);
+      }
+    } catch (e) {
+      // 忽略
+    }
+  }
+
+  /**
+   * 读当前工作目录下的文件为 base64(二进制安全,供网页端打包 ZIP)。
+   * 网页端只有文本读写桥,压缩需要原始字节,所以这里单独提供。
+   *
+   * 返回约定(必须让调用方区分「空文件」和「读取失败」):
+   *   "b64:<base64>"  读取成功(空文件是 "b64:",解出来 0 字节)
+   *   ""              读取失败 / 目标是目录
+   * 之前空文件返回空串,网页端把它当成失败而跳过,
+   * 导致「导出全部」在有 0 字节文件时导出为空。
+   */
+  gitReadB64(rel: string): string {
+    try {
+      const p: string = this.abs(rel);
+      const st = fs.statSync(p);
+      if (st.isDirectory()) {
+        return '';
+      }
+      const len: number = st.size;
+      if (len <= 0) {
+        return 'b64:';                 // 空文件:成功,内容为 0 字节
+      }
+      const buf: ArrayBuffer = new ArrayBuffer(len);
+      const f = fs.openSync(p, fs.OpenMode.READ_ONLY);
+      const read: number = fs.readSync(f.fd, buf);
+      fs.closeSync(f);
+      const bytes: Uint8Array = new Uint8Array(buf.slice(0, read));
+      this.fsOps++;
+      return 'b64:' + this.b64.encodeToStringSync(bytes);
+    } catch (e) {
+      this.noteErr('gitReadB64', rel, e);
+      return '';
+    }
+  }
+
+  /**
+   * 弹保存对话框,把 base64 内容写进去。
+   * 这是平台允许的唯一写入用户可见目录的方式 —— save() 会给返回的那个 file URI
+   * 授予写权限(实测:选文件夹拿到的目录 URI 连 listFile 都失败 13900002,
+   *  同目录下新建其它文件也是 13900002,建子目录 13900012)。
+   * 所以「批量导出」必须先打包成一个文件,再走这里保存。
+   */
+  saveB64(fileName: string, b64: string): void {
+    const b64s: string = (b64 === undefined || b64 === null) ? '' : b64;
+    this.log('[EXPORT] 保存 ' + fileName + ' , base64 长度 ' + b64s.length);
+    let data: Uint8Array;
+    if (b64s.length === 0) {
+      /* 空内容必须单独处理:decodeSync('') 会抛异常,
+         表现为「新建空 txt 保存到手机」时报错「内容解码失败」。 */
+      data = new Uint8Array(0);
+    } else {
+      try {
+        data = this.b64.decodeSync(b64s);
+      } catch (e) {
+        const be = e as BusinessError;
+        this.log('[EXPORT] 解码失败 code=' + be.code + ' msg=' + be.message);
+        this.fail('saveB64', '内容解码失败');
+        return;
+      }
+    }
+    const opts = new picker.DocumentSaveOptions();
+    opts.newFileNames = [fileName];
+    const saver = new picker.DocumentViewPicker(this.context);
+    saver.save(opts).then((uris: Array<string>) => {
+      if (uris === undefined || uris === null || uris.length === 0) {
+        this.log('[EXPORT] 用户取消');
+        this.fail('saveB64', '已取消');
+        return;
+      }
+      const u: string = uris[0];
+      try {
+        const out = fs.openSync(u, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+        if (data.length > 0) {
+          fs.writeSync(out.fd, data.buffer);
+        }
+        fs.closeSync(out);
+        this.log('[EXPORT] 写入成功 → ' + u + ' (' + data.length + ' 字节)');
+        this.okData('saveB64', u);
+      } catch (e) {
+        const be = e as BusinessError;
+        this.log('[EXPORT] 写入失败 code=' + be.code + ' ' + be.message);
+        this.fail('saveB64', '写入失败: ' + be.message);
+      }
+    }).catch((err: BusinessError) => {
+      const code: number = (err !== undefined) ? err.code : -1;
+      this.log('[EXPORT] 选择器异常 code=' + code);
+      this.fail('saveB64', code === 13900042 ? '已取消' : ('保存失败 code=' + code));
+    });
   }
 
   /** 记录一次原生文件操作失败(供网页诊断) */
@@ -174,7 +296,8 @@ class MaziBridge {
       this.log('[POST-TEST] 需要仓库地址');
       return;
     }
-    const body: Uint8Array = this.b64.decodeSync(bodyB64);
+    const body: Uint8Array = (bodyB64 === undefined || bodyB64 === null || bodyB64.length === 0)
+      ? new Uint8Array(0) : this.b64.decodeSync(bodyB64);
     const ab: ArrayBuffer = new ArrayBuffer(body.length);
     const view: Uint8Array = new Uint8Array(ab);
     for (let i = 0; i < body.length; i++) {
@@ -235,14 +358,27 @@ class MaziBridge {
 
   /**
    * 把工作根目录设为应用私有目录 (context.filesDir)。
-   * 完全不依赖文件选择器与用户授权,用来验证 git 本身在这台设备上能否跑通 ——
-   * 私有目录下 fileIo 的 listFile / mkdir / open 都是完整可用的。
+   *
+   * 注意:必须同时清掉 preferences 里存的「上次选定的文件夹」。
+   * 否则 onPageEnd 的 restoreFolder() 会把那个旧 URI 恢复回来并覆盖这里的设置
+   * (它有 await,所以会晚于 useAppDir 写入),导致工作目录变成
+   * file://docs/storage/Users/currentUser/... ,于是 git 找不到 .git,
+   * 表现为「状态和提交历史出不来」。
    */
   useAppDir(): void {
     try {
       const dir: string = this.context.filesDir;
       this.rootUri = dir;
       this.rootName = '应用目录';
+      // 清掉可能残留的用户文件夹记录,避免被 restoreFolder 覆盖
+      try {
+        const pref = preferences.getPreferencesSync(this.context, { name: PREF_STORE });
+        pref.deleteSync(PREF_KEY_URI);
+        pref.deleteSync(PREF_KEY_NAME);
+        pref.flush();
+      } catch (e) {
+        // 清不掉也不影响本次会话
+      }
       let probe: string = 'filesDir=' + dir;
       try {
         const names: string[] = fs.listFileSync(dir);
@@ -424,8 +560,20 @@ class MaziBridge {
 
   // ==================== 文件夹选择与授权 ====================
 
-  /** 恢复上次选定的文件夹(并重新激活持久化授权) */
+  /**
+   * 恢复上次选定的文件夹。
+   *
+   * 现在**不再使用**:应用的工作目录固定为私有目录(用户目录拿不到建目录权限)。
+   * 保留此方法但直接跳过恢复 —— 否则它会把持久化里的旧用户文件夹 URI 恢复回来,
+   * 覆盖 useAppDir() 设好的私有目录,导致 git 找不到 .git。
+   */
   async restoreFolder(): Promise<void> {
+    this.log('[FOLDER] restoreFolder 已停用(工作目录固定为应用私有目录)');
+    return;
+  }
+
+  /** 旧的恢复逻辑,保留备查 */
+  private async restoreFolderLegacy(): Promise<void> {
     try {
       const pref = preferences.getPreferencesSync(this.context, { name: PREF_STORE });
       const uri: string = pref.getSync(PREF_KEY_URI, '') as string;
@@ -455,17 +603,22 @@ class MaziBridge {
 
   /** 让用户选一个文件夹作为「稿件文件夹」 */
   pickFolder(): void {
+    this.log('[NATIVE] pickFolder 被调用');
     const options = new picker.DocumentSelectOptions();
     options.selectMode = picker.DocumentSelectMode.FOLDER;
     options.maxSelectNumber = 1;
     const documentPicker = new picker.DocumentViewPicker(this.context);
     documentPicker.select(options).then(async (uris: Array<string>) => {
+      this.log('[NATIVE] 选择器返回, uris=' + JSON.stringify(uris));
       if (uris === undefined || uris === null || uris.length === 0) {
+        this.log('[NATIVE] 空结果,当作取消');
+        this.fail('pickFolder', '已取消');
         return;
       }
       const uri: string = uris[0];
       this.rootUri = uri;
       this.rootName = this.baseName(uri);
+      this.log('[NATIVE] 选中 uri=' + uri + ' name=' + this.rootName);
 
       // 立刻取证:选择器给的 UR 到底能不能访问?不能就说明是 URI/授权的问题,
       // 而不是后面写文件的逻辑问题 —— 之前这里失败被静默吞掉,查了很久。
@@ -534,8 +687,11 @@ class MaziBridge {
         isEmpty = false;
       }
       const picked: MaziPickResult = { uri: uri, name: this.rootName, persisted: persisted, empty: isEmpty };
+      this.log('[NATIVE] 回调网页 pickFolder OK, empty=' + isEmpty);
       this.okData('pickFolder', picked);
     }).catch((err: BusinessError) => {
+      this.log('[NATIVE] 选择器异常 code=' + (err !== undefined ? err.code : -1)
+        + ' msg=' + (err !== undefined ? err.message : '?'));
       if (err !== undefined && err.code !== 13900042) {
         this.fail('pickFolder', '选择文件夹失败');
       } else {
@@ -665,24 +821,94 @@ class MaziBridge {
     }
     const target: string = this.abs(rel);
     try {
-      let bytes: Uint8Array;
-      const enc: string = (encoding === undefined || encoding === null || encoding.length === 0) ? 'utf-8' : encoding;
-      if (enc === 'utf-8') {
-        bytes = new util.TextEncoder().encodeInto(text);
-      } else {
-        bytes = util.TextEncoder.create(enc).encodeInto(text);
-      }
+      /* 一律按 UTF-8 写:之前用 TextEncoder.create(enc) 传别的编码名会拿到 undefined */
+      const buf: ArrayBuffer = this.utf8BufferOf(text);
       const file = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(file.fd, bytes.buffer);
+      fs.writeSync(file.fd, buf);
       fs.closeSync(file);
-      const wrote: MaziWriteResult = { path: rel, bytes: bytes.length };
+      const wrote: MaziWriteResult = { path: rel, bytes: buf.byteLength };
+      this.log('[WRITE] writeText 成功 ' + rel + ' (' + buf.byteLength + ' 字节)');
       this.okData('writeText', wrote);
     } catch (e) {
-      this.fail('writeText', '保存失败：' + rel);
+      const be = e as BusinessError;
+      this.log('[WRITE] writeText 失败 code=' + be.code + ' msg=' + be.message + ' -> ' + rel);
+      this.fail('writeText', '保存失败 code=' + be.code + '：' + rel);
     }
   }
 
   // ==================== 文件操作 ====================
+
+  /**
+   * 把字符串按 UTF-8 编成 ArrayBuffer。
+   *
+   * 为什么不用 util.TextEncoder().encodeInto():它的返回类型/实际值在 ArkTS 里
+   * 不稳定 —— 同一个调用在 log() 里能用,在 createFile() 里却拿到 undefined,
+   * 报 "Cannot read property buffer/length of undefined"。
+   * 手写编码逻辑清晰、行为确定,且不依赖可能变化的 API。
+   */
+  private utf8BufferOf(s: string): ArrayBuffer {
+    const src: string = (s === undefined || s === null) ? '' : s;
+    let n: number = 0;
+    for (let i = 0; i < src.length; i++) {
+      const c: number = src.charCodeAt(i);
+      if (c < 0x80) {
+        n += 1;
+      } else if (c < 0x800) {
+        n += 2;
+      } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < src.length) {
+        const c2: number = src.charCodeAt(i + 1);
+        if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+          n += 4;
+          i++;
+        } else {
+          n += 3;
+        }
+      } else {
+        n += 3;
+      }
+    }
+    const ab: ArrayBuffer = new ArrayBuffer(n);
+    const out: Uint8Array = new Uint8Array(ab);
+    let p: number = 0;
+    for (let i = 0; i < src.length; i++) {
+      let c: number = src.charCodeAt(i);
+      if (c >= 0xD800 && c <= 0xDBFF && i + 1 < src.length) {
+        const c2b: number = src.charCodeAt(i + 1);
+        if (c2b >= 0xDC00 && c2b <= 0xDFFF) {
+          c = 0x10000 + ((c - 0xD800) << 10) + (c2b - 0xDC00);
+          i++;
+        } else {
+          c = 0xFFFD;
+        }
+      }
+      if (c < 0x80) {
+        out[p++] = c;
+      } else if (c < 0x800) {
+        out[p++] = 0xC0 | (c >> 6);
+        out[p++] = 0x80 | (c & 0x3F);
+      } else if (c < 0x10000) {
+        out[p++] = 0xE0 | (c >> 12);
+        out[p++] = 0x80 | ((c >> 6) & 0x3F);
+        out[p++] = 0x80 | (c & 0x3F);
+      } else {
+        out[p++] = 0xF0 | (c >> 18);
+        out[p++] = 0x80 | ((c >> 12) & 0x3F);
+        out[p++] = 0x80 | ((c >> 6) & 0x3F);
+        out[p++] = 0x80 | (c & 0x3F);
+      }
+    }
+    return ab;
+  }
+
+  /** 校验/复制 Uint8Array 到新 ArrayBuffer(保留作兼容) */
+  private utf8Buffer(bytes: Uint8Array): ArrayBuffer {
+    const ab: ArrayBuffer = new ArrayBuffer(bytes.length);
+    const view: Uint8Array = new Uint8Array(ab);
+    for (let i = 0; i < bytes.length; i++) {
+      view[i] = bytes[i];
+    }
+    return ab;
+  }
 
   createFile(rel: string, text: string): void {
     if (this.rootUri.length === 0) {
@@ -690,6 +916,7 @@ class MaziBridge {
       return;
     }
     const target: string = this.abs(rel);
+    this.log('[NEW] createFile rel=' + rel + ' target=' + target);
     try {
       // 用 exists() 而不是直接 fs.accessSync:后者在「不存在」时抛异常,
       // 会让 if 直接跳到 catch,于是永远判不出「已存在」,变成静默覆盖同名文件
@@ -698,14 +925,17 @@ class MaziBridge {
         return;
       }
       const content: string = (text === undefined || text === null) ? '' : text;
-      const bytes: Uint8Array = new util.TextEncoder().encodeInto(content);
+      const buf: ArrayBuffer = this.utf8BufferOf(content);
       const file = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(file.fd, bytes.buffer);
+      fs.writeSync(file.fd, buf);
       fs.closeSync(file);
-      const wrote: MaziWriteResult = { path: rel, bytes: bytes.length };
+      const wrote: MaziWriteResult = { path: rel, bytes: buf.byteLength };
+      this.log('[NEW] createFile 成功 ' + target + ' (' + buf.byteLength + ' 字节)');
       this.okData('createFile', wrote);
     } catch (e) {
-      this.fail('createFile', '新建失败：' + rel);
+      const be = e as BusinessError;
+      this.log('[NEW] createFile 失败 code=' + be.code + ' msg=' + be.message + ' -> ' + target);
+      this.fail('createFile', '新建失败 code=' + be.code + '：' + rel);
     }
   }
 
@@ -714,12 +944,19 @@ class MaziBridge {
       this.fail('mkdir', '还没有选定文件夹');
       return;
     }
+    const target: string = this.abs(rel);
+    this.log('[NEW] mkdir rel=' + rel + ' target=' + target + ' 已存在=' + this.exists(target));
     try {
-      fs.mkdirSync(this.abs(rel));
+      // 递归模式:新建「a/b」这种多层目录时非递归会失败
+      fs.mkdirSync(target, true);
+      this.fsOps++;
       const wrote: MaziWriteResult = { path: rel, bytes: 0 };
+      this.log('[NEW] mkdir 成功 ' + target);
       this.okData('mkdir', wrote);
     } catch (e) {
-      this.fail('mkdir', '新建文件夹失败：' + rel);
+      const be = e as BusinessError;
+      this.log('[NEW] mkdir 失败 code=' + be.code + ' msg=' + be.message + ' -> ' + target);
+      this.fail('mkdir', '新建文件夹失败 code=' + be.code + '：' + rel);
     }
   }
 
@@ -739,6 +976,57 @@ class MaziBridge {
       this.okData('remove', wrote);
     } catch (e) {
       this.fail('remove', '删除失败(目录需为空)：' + rel);
+    }
+  }
+
+  /** 递归删除目录。rmdirSync 只能删空目录,所以文件夹删除必须用这个。 */
+  private rmTreeAbs(path: string): void {
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(path);
+    } catch (e) {
+      names = [];
+    }
+    for (let i = 0; i < names.length; i++) {
+      const child: string = path + '/' + names[i];
+      let isDir: boolean = false;
+      try {
+        isDir = fs.statSync(child).isDirectory();
+      } catch (e2) {
+        isDir = false;
+      }
+      if (isDir) {
+        this.rmTreeAbs(child);
+      } else {
+        try {
+          fs.unlinkSync(child);
+        } catch (e3) {
+          // 单个文件失败继续删其它
+        }
+      }
+    }
+    fs.rmdirSync(path);
+  }
+
+  /** 删除文件夹(含全部内容) */
+  deleteTree(rel: string): void {
+    if (this.rootUri.length === 0) {
+      this.fail('deleteTree', '还没有选定文件夹');
+      return;
+    }
+    if (rel === undefined || rel === null || rel.length === 0) {
+      this.fail('deleteTree', '不能删除根目录');
+      return;
+    }
+    const target: string = this.abs(rel);
+    try {
+      this.rmTreeAbs(target);
+      this.fsOps++;
+      const wrote: MaziWriteResult = { path: rel, bytes: 0 };
+      this.okData('deleteTree', wrote);
+    } catch (e) {
+      const be = e as BusinessError;
+      this.fail('deleteTree', '删除失败 code=' + be.code + '：' + rel);
     }
   }
 
@@ -766,7 +1054,16 @@ class MaziBridge {
   // isomorphic-git 通过 window.MaziHarmony.git* 同步读写仓库文件。
   // 字符串走 UTF-8;二进制走 base64(前缀 "b64:")以保证字节完全一致。
 
-  /** 读文件:返回 UTF-8 文本;二进制则返回 "b64:<base64>" ;失败返回 null */
+  /**
+   * 读文件。**始终**以 "b64:<base64>" 返回,由网页端按需解码。
+   *
+   * 为什么不再自动判文本/二进制:之前用「有没有 0x00 字节」来猜,
+   * 但 zlib 压缩过的 git 对象(对象头 78 01 / 78 9C / 78 DA)里几乎没有 0 字节,
+   * 会被误判成文本 → 走 UTF-8 解码 → 字节被破坏 →
+   * pako 报 "incorrect header check",表现为「提交/推送失败」而克隆正常
+   * (克隆的数据在内存里,不经过这条读路径)。
+   * 一律走 base64 可以保证字节完全一致。
+   */
   gitRead(rel: string): string | null {
     if (this.rootUri.length === 0) {
       return null;
@@ -774,25 +1071,16 @@ class MaziBridge {
     try {
       const file = fs.openSync(this.abs(rel), fs.OpenMode.READ_ONLY);
       const size: number = fs.statSync(file.fd).size;
+      if (size <= 0) {
+        fs.closeSync(file);
+        return 'b64:';
+      }
       const buffer: ArrayBuffer = new ArrayBuffer(size);
-      fs.readSync(file.fd, buffer);
+      const read: number = fs.readSync(file.fd, buffer);
       fs.closeSync(file);
-      const bytes: Uint8Array = new Uint8Array(buffer);
-      let binary: boolean = false;
-      for (let i = 0; i < bytes.length; i++) {
-        if (bytes[i] === 0) {
-          binary = true;
-          break;
-        }
-      }
-      if (binary) {
-        return 'b64:' + this.b64.encodeToStringSync(bytes);
-      }
-      try {
-        return util.TextDecoder.create('utf-8').decodeToString(bytes);
-      } catch (e) {
-        return 'b64:' + this.b64.encodeToStringSync(bytes);
-      }
+      const bytes: Uint8Array = new Uint8Array(buffer.slice(0, read));
+      this.fsOps++;
+      return 'b64:' + this.b64.encodeToStringSync(bytes);
     } catch (e) {
       return null;
     }
@@ -853,16 +1141,29 @@ class MaziBridge {
         this.ensureDirAbs(this.abs(relNorm.substring(0, i)));
       }
       stage = 'encode';
-      let bytes: Uint8Array;
-      if (data !== null && data !== undefined && data.length > 6 && data.substring(0, 4) === 'b64:') {
-        bytes = this.b64.decodeSync(data.substring(4));
+      let buf: ArrayBuffer;
+      /* 判断必须只看前缀,不能用长度当条件 ——
+         之前写的是 data.length > 6,而**空文件的 base64 是空串**,
+         payload 恰好是 'b64:'(长度 4,不大于 6),于是被当成文本,
+         结果把字面量 "b64:" 写进了文件(首次推送会看到空文件里多了 b64:)。
+         前缀判断对空数据也成立,'b64:' 解出来就是 0 字节。
+         注意:decodeSync('') 会抛 "length greater than 0",所以空内容要单独处理,
+         否则仓库里只要有 0 字节文件,克隆就会整批失败。 */
+      if (data !== null && data !== undefined && data.length >= 4 && data.substring(0, 4) === 'b64:') {
+        const b64Body: string = data.substring(4);
+        if (b64Body.length === 0) {
+          buf = new ArrayBuffer(0);       // 空文件:写 0 字节
+        } else {
+          const raw: Uint8Array = this.b64.decodeSync(b64Body);
+          buf = this.utf8Buffer(raw);
+        }
       } else {
-        bytes = new util.TextEncoder().encodeInto(data === undefined || data === null ? '' : data);
+        buf = this.utf8BufferOf(data === undefined || data === null ? '' : data);
       }
       stage = 'open';
       const file = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       stage = 'write';
-      fs.writeSync(file.fd, bytes.buffer);
+      fs.writeSync(file.fd, buf);
       stage = 'close';
       fs.closeSync(file);
       this.fsOps++;
@@ -939,14 +1240,23 @@ class MaziBridge {
     }
   }
 
-  /** 路径是否存在 */
+  /**
+   * 路径是否存在。
+   * 用 statSync 而不是 accessSync —— 实测 accessSync 对本应用私有目录里的
+   * 刚创建目录会返回 false(文件确实存在),而 statSync 判断可靠。
+   */
   gitExists(rel: string): boolean {
     if (this.rootUri.length === 0) {
+      this.log('[EXISTS] rootUri 为空,直接 false (rel=' + rel + ')');
       return false;
     }
+    const full: string = this.abs(rel);
     try {
-      return fs.accessSync(this.abs(rel));
+      fs.statSync(full);
+      return true;
     } catch (e) {
+      const be = e as BusinessError;
+      this.log('[EXISTS] false: ' + full + '  code=' + be.code + ' ' + be.message);
       return false;
     }
   }
@@ -1255,7 +1565,8 @@ struct Index {
             'createFile', 'mkdir', 'remove', 'rename',
             'gitRead', 'gitWrite', 'gitMkdir', 'gitUnlink', 'gitRmdir',
             'gitReaddir', 'gitStat', 'gitExists', 'gitHttp', 'lastNativeErr', 'probeUri',
-            'configLoad', 'configSet', 'configRemove', 'useAppDir', 'log', 'testHttpPost',
+            'configLoad', 'configSet', 'configRemove', 'useAppDir', 'log', 'clearLog', 'testHttpPost',
+            'gitReadB64', 'saveB64', 'deleteTree',
             'saveText', 'importFile'
           ],
           controller: this.controller
